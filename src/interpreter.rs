@@ -35,7 +35,9 @@ struct WorkItem {
     scope: Scope,
     rule: String,
     depth: usize,
-    /// Accumulated taper from ancestor ops (propagated to the terminal).
+    /// Taper value set by `ShapeOp::Taper` within this rule invocation; propagated
+    /// to the terminal. Branching ops (Split/Comp/Repeat) reset it to 0.0 for
+    /// children — taper is not accumulated across rule boundaries.
     taper: f64,
     /// Material identifier set by `Mat("...")` ops; propagates to child scopes.
     material: Option<String>,
@@ -77,6 +79,11 @@ fn resolve_split_sizes(slots: &[SplitSlot], total_dim: f64) -> Result<Vec<f64>, 
                 float_weight_total += w;
             }
         }
+    }
+
+    // Guard against absolute-size sum overflow (e.g. 256 slots each with 1e307).
+    if !used.is_finite() {
+        return Err(ShapeError::InvalidNumericValue);
     }
 
     if used > total_dim + 1e-9 {
@@ -435,6 +442,12 @@ impl Interpreter {
                         return Err(ShapeError::InvalidNumericValue);
                     }
                     scope.size *= *v;
+                    // Two individually-finite scale values can multiply to INFINITY
+                    // (e.g. 1e200 * 1e200). Catch the overflow here before it
+                    // propagates into Split/Repeat and causes NaN via ∞ − ∞.
+                    if !scope.size.is_finite() {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
                 }
 
                 ShapeOp::Mat(mat_id) => {
@@ -485,8 +498,17 @@ impl Interpreter {
                         Axis::Y => scope.size.y,
                         Axis::Z => scope.size.z,
                     };
-                    let n_tiles = (total / tile_size).floor() as usize;
-                    if queue.len() + n_tiles > MAX_QUEUE {
+                    // `total / tile_size` can overflow to INFINITY for very small
+                    // tile_size values (e.g. f64::MIN_POSITIVE). The subsequent
+                    // `as usize` cast would saturate to usize::MAX, and
+                    // `queue.len() + usize::MAX` wraps to 0 in release mode,
+                    // bypassing the capacity guard and looping usize::MAX times.
+                    let n_tiles_f = (total / tile_size).floor();
+                    if !n_tiles_f.is_finite() {
+                        return Err(ShapeError::CapacityOverflow);
+                    }
+                    let n_tiles = n_tiles_f as usize;
+                    if queue.len().saturating_add(n_tiles) > MAX_QUEUE {
                         return Err(ShapeError::CapacityOverflow);
                     }
                     if n_tiles > 0 {
@@ -731,6 +753,65 @@ mod tests {
         interp.add_weighted_rules("Empty", vec![]);
         let model = interp.derive(Scope::unit(), "Empty").unwrap();
         assert_eq!(model.len(), 0);
+    }
+
+    // ── Issue 1 (review #10): n_tiles INFINITY cast ───────────────────────────
+
+    #[test]
+    fn test_repeat_tiny_tile_size_rejected() {
+        // tile_size = f64::MIN_POSITIVE is finite and > 0, passes validation.
+        // But total / f64::MIN_POSITIVE overflows to INFINITY, and
+        // INFINITY as usize saturates to usize::MAX, causing overflow in the
+        // queue length arithmetic. Must be caught as CapacityOverflow.
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Repeat {
+                axis: Axis::X,
+                tile_size: f64::MIN_POSITIVE,
+                rule: "Tile".to_string(),
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(1.0, 1.0, 1.0));
+        assert!(matches!(
+            interp.derive(scope, "R"),
+            Err(ShapeError::CapacityOverflow)
+        ));
+    }
+
+    // ── Issue 3 (review #10): Scale multiplication overflow ───────────────────
+
+    #[test]
+    fn test_scale_multiply_overflow_to_infinity_rejected() {
+        // Each Scale value is individually finite and positive, but scope.size *= v
+        // can overflow to INFINITY. Must be caught after the multiplication.
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Scale(Vec3::new(1e200, 1.0, 1.0)),
+                ShapeOp::Scale(Vec3::new(1e200, 1.0, 1.0)), // 1e200*1e200=INFINITY
+                ShapeOp::I("Mesh".to_string()),
+            ],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(1.0, 1.0, 1.0));
+        assert!(matches!(
+            interp.derive(scope, "R"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_split_absolute_sum_overflow_rejected() {
+        // Absolute slot sizes whose sum overflows to INFINITY must be rejected.
+        let slots = vec![
+            slot(SplitSize::Absolute(f64::MAX), "A"),
+            slot(SplitSize::Absolute(f64::MAX), "B"),
+        ];
+        assert!(matches!(
+            resolve_split_sizes(&slots, f64::MAX),
+            Err(ShapeError::InvalidNumericValue)
+        ));
     }
 
     // ── Issue 3: queue capacity accounting ────────────────────────────────────

@@ -444,28 +444,23 @@ fn split_top_level_pipe(s: &str) -> Vec<&str> {
     let mut in_line_comment = false;
     let mut start = 0;
     let mut parts = Vec::new();
-    // Collect into a vec so we can peek ahead by index.
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let len = chars.len();
-    let mut i = 0;
+    // Use a Peekable iterator so we never allocate the full char list — a
+    // Vec<(usize,char)> of the whole input would be O(n) memory (16 bytes per
+    // char on 64-bit) even before any safety limits can fire.
+    let mut iter = s.char_indices().peekable();
 
-    while i < len {
-        let (byte_pos, c) = chars[i];
-
+    while let Some((byte_pos, c)) = iter.next() {
         if in_line_comment {
             if c == '\n' || c == '\r' {
                 in_line_comment = false;
             }
-            i += 1;
             continue;
         }
 
         if in_block_comment {
-            if c == '*' && i + 1 < len && chars[i + 1].1 == '/' {
+            if c == '*' && matches!(iter.peek(), Some((_, '/'))) {
+                iter.next(); // consume '/'
                 in_block_comment = false;
-                i += 2;
-            } else {
-                i += 1;
             }
             continue;
         }
@@ -474,21 +469,20 @@ fn split_top_level_pipe(s: &str) -> Vec<&str> {
             if c == '"' {
                 in_string = false;
             }
-            i += 1;
             continue;
         }
 
         // Normal (unquoted, uncommented) context — check for comment openers.
-        if c == '/' && i + 1 < len {
-            match chars[i + 1].1 {
-                '/' => {
+        if c == '/' {
+            match iter.peek() {
+                Some(&(_, '/')) => {
+                    iter.next();
                     in_line_comment = true;
-                    i += 2;
                     continue;
                 }
-                '*' => {
+                Some(&(_, '*')) => {
+                    iter.next();
                     in_block_comment = true;
-                    i += 2;
                     continue;
                 }
                 _ => {}
@@ -505,7 +499,6 @@ fn split_top_level_pipe(s: &str) -> Vec<&str> {
             }
             _ => {}
         }
-        i += 1;
     }
 
     parts.push(s[start..].trim());
@@ -547,8 +540,12 @@ pub struct GrammarRule {
 
 impl GrammarRule {
     /// Convenience accessor for deterministic (single-variant) rules.
+    /// Returns an empty slice if the rule has no variants.
     pub fn ops(&self) -> &[ShapeOp] {
-        &self.variants[0].1
+        self.variants
+            .first()
+            .map(|(_, ops)| ops.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -727,6 +724,17 @@ mod tests {
     fn test_comments_ignored() {
         let ops = parse_ops("// comment\nExtrude(5) /* block */ Taper(0.2)").unwrap();
         assert_eq!(ops.len(), 2);
+    }
+
+    // ── Issue 5 (review #10): GrammarRule::ops() safe on empty variants ──────
+
+    #[test]
+    fn test_grammar_rule_ops_empty_variants_returns_empty() {
+        let rule = GrammarRule {
+            name: "Empty".to_string(),
+            variants: vec![],
+        };
+        assert_eq!(rule.ops(), &[] as &[ShapeOp]);
     }
 
     // ── Issue 2: quaternion overflow bypass ───────────────────────────────────
