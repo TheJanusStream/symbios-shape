@@ -75,9 +75,12 @@ fn is_ident_char(c: char) -> bool {
 }
 
 fn identifier(input: &str) -> IResult<&str, &str> {
+    let original = input;
     let (input, s) = take_while1(is_ident_char).parse(input)?;
     if !s.chars().next().map(is_ident_start).unwrap_or(false) {
-        return Err(nom::Err::Error(Error::new(input, ErrorKind::Alpha)));
+        // Use `original` so the error span points to the start of the bad token,
+        // not to the position after consuming it.
+        return Err(nom::Err::Error(Error::new(original, ErrorKind::Alpha)));
     }
     if s.len() > MAX_IDENTIFIER_LEN {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::TooLarge)));
@@ -221,6 +224,9 @@ fn parse_translate(input: &str) -> IResult<&str, ShapeOp> {
 fn parse_scale(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Scale").parse(input)?;
     let (input, v) = ws(parse_vec3).parse(input)?;
+    if v.x <= 0.0 || v.y <= 0.0 || v.z <= 0.0 {
+        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+    }
     Ok((input, ShapeOp::Scale(v)))
 }
 
@@ -359,6 +365,20 @@ fn parse_op(input: &str) -> IResult<&str, ShapeOp> {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Returns true if `op` ends execution of a rule body — either by branching
+/// (Split / Comp / Repeat) or by producing a terminal (I / Rule).
+/// Any operations listed after such an op in the source are unreachable.
+fn is_terminating_op(op: &ShapeOp) -> bool {
+    matches!(
+        op,
+        ShapeOp::I(_)
+            | ShapeOp::Rule(_)
+            | ShapeOp::Split { .. }
+            | ShapeOp::Comp(_)
+            | ShapeOp::Repeat { .. }
+    )
+}
+
 /// Parses a sequence of CGA operations separated by optional whitespace/newlines.
 ///
 /// # Example
@@ -386,8 +406,22 @@ pub fn parse_ops(input: &str) -> Result<Vec<ShapeOp>, ShapeError> {
         }
 
         let (next, op) = parse_op(remaining).map_err(|e| ShapeError::ParseError(e.to_string()))?;
+        let terminates = is_terminating_op(&op);
         ops.push(op);
         remaining = next;
+
+        if terminates {
+            // Any content after a terminal/branching op is unreachable. Catch it
+            // here so the parser rejects such rules rather than silently dropping ops.
+            let (after_ws, _) = space_or_comment::<Error<&str>>(remaining)
+                .map_err(|e| ShapeError::ParseError(e.to_string()))?;
+            if !after_ws.is_empty() {
+                return Err(ShapeError::ParseError(
+                    "unreachable operations after terminal or branching op".to_string(),
+                ));
+            }
+            break;
+        }
     }
 
     Ok(ops)
@@ -395,23 +429,84 @@ pub fn parse_ops(input: &str) -> Result<Vec<ShapeOp>, ShapeError> {
 
 // ── Stochastic rule helpers ───────────────────────────────────────────────────
 
-/// Splits `s` on `|` characters at brace depth 0.
-/// This correctly skips `|` inside `Split { }` and `Comp { }` blocks.
+/// Splits `s` on `|` characters at brace depth 0, respecting quoted strings
+/// and comments so that `|` inside `"Wall|Door"` or `/* { */` is ignored.
+///
+/// Contexts handled:
+/// - `"..."` string literals — `|` and `{`/`}` inside are invisible.
+/// - `/* ... */` block comments — same.
+/// - `// ...` line comments — same (skipped until `\n` or `\r`).
 fn split_top_level_pipe(s: &str) -> Vec<&str> {
     let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut in_block_comment = false;
+    let mut in_line_comment = false;
     let mut start = 0;
     let mut parts = Vec::new();
-    for (i, c) in s.char_indices() {
+    // Collect into a vec so we can peek ahead by index.
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let (byte_pos, c) = chars[i];
+
+        if in_line_comment {
+            if c == '\n' || c == '\r' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if c == '*' && i + 1 < len && chars[i + 1].1 == '/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Normal (unquoted, uncommented) context — check for comment openers.
+        if c == '/' && i + 1 < len {
+            match chars[i + 1].1 {
+                '/' => {
+                    in_line_comment = true;
+                    i += 2;
+                    continue;
+                }
+                '*' => {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         match c {
+            '"' => in_string = true,
             '{' => depth += 1,
             '}' => depth -= 1,
             '|' if depth == 0 => {
-                parts.push(s[start..i].trim());
-                start = i + 1;
+                parts.push(s[start..byte_pos].trim());
+                start = byte_pos + c.len_utf8();
             }
             _ => {}
         }
+        i += 1;
     }
+
     parts.push(s[start..].trim());
     parts
 }
@@ -484,8 +579,13 @@ pub fn parse_rule(input: &str) -> Result<GrammarRule, ShapeError> {
             })
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        // Single deterministic variant
-        vec![(1.0, parse_ops(remaining)?)]
+        // Single variant: may optionally carry a `weight%` prefix (e.g. `100% Extrude(10)`).
+        // If present, strip it; otherwise treat as deterministic weight 1.0.
+        let part = parts[0];
+        match try_parse_weight(part) {
+            Some((weight, rest)) => vec![(weight, parse_ops(rest)?)],
+            None => vec![(1.0, parse_ops(remaining)?)],
+        }
     };
 
     Ok(GrammarRule {
@@ -626,5 +726,72 @@ mod tests {
     fn test_comments_ignored() {
         let ops = parse_ops("// comment\nExtrude(5) /* block */ Taper(0.2)").unwrap();
         assert_eq!(ops.len(), 2);
+    }
+
+    // ── Issue 1: split_top_level_pipe must ignore `|` inside quoted strings ────
+
+    #[test]
+    fn test_pipe_in_quoted_mesh_id_not_split() {
+        // `|` inside `"Wall|Door"` must NOT be treated as a stochastic separator.
+        let rule = parse_rule(r#"Lot --> I("Wall|Door")"#).unwrap();
+        assert_eq!(rule.variants.len(), 1);
+        assert_eq!(
+            rule.variants[0].1,
+            vec![ShapeOp::I("Wall|Door".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_block_comment_with_brace_does_not_confuse_depth() {
+        // `/* { */` must not increment brace depth, so the top-level `|` is still found.
+        let rule = parse_rule("Facade --> 50% Extrude(10) /* { */ | 50% I(Solid)").unwrap();
+        assert_eq!(rule.variants.len(), 2);
+        assert!((rule.variants[0].0 - 0.50).abs() < 1e-9);
+        assert!((rule.variants[1].0 - 0.50).abs() < 1e-9);
+    }
+
+    // ── Issue 2: unreachable ops after terminal/branching op are rejected ──────
+
+    #[test]
+    fn test_ops_after_instance_rejected() {
+        assert!(parse_ops(r#"I("Wall") Scale(2, 2, 2)"#).is_err());
+    }
+
+    #[test]
+    fn test_ops_after_rule_ref_rejected() {
+        assert!(parse_ops("Floor Scale(2, 2, 2)").is_err());
+    }
+
+    #[test]
+    fn test_ops_after_split_rejected() {
+        assert!(parse_ops("Split(Y) { ~1: A | ~1: B } Scale(1, 2, 1)").is_err());
+    }
+
+    // ── Issue 3: single-variant stochastic rule (100% prefix) ─────────────────
+
+    #[test]
+    fn test_single_variant_with_weight_prefix() {
+        let rule = parse_rule("Lot --> 100% Extrude(10)").unwrap();
+        assert_eq!(rule.variants.len(), 1);
+        assert!((rule.variants[0].0 - 1.0).abs() < 1e-9);
+        assert_eq!(rule.variants[0].1, vec![ShapeOp::Extrude(10.0)]);
+    }
+
+    // ── Issue 5: non-positive scale values are rejected ───────────────────────
+
+    #[test]
+    fn test_scale_negative_rejected() {
+        assert!(parse_ops("Scale(-1, 1, 1)").is_err());
+    }
+
+    #[test]
+    fn test_scale_zero_rejected() {
+        assert!(parse_ops("Scale(0, 1, 1)").is_err());
+    }
+
+    #[test]
+    fn test_scale_positive_accepted() {
+        let ops = parse_ops("Scale(0.5, 2, 1)").unwrap();
+        assert_eq!(ops.len(), 1);
     }
 }
