@@ -147,7 +147,8 @@ fn parse_quat(input: &str) -> IResult<&str, Quat> {
     // glam requires unit quaternions; normalize the user-supplied values.
     // Reject degenerate (near-zero) inputs that cannot be normalized.
     let len_sq = x * x + y * y + z * z + w * w;
-    if len_sq < 1e-12 {
+    // Also reject overflow: components like 1e160 are finite but len_sq = INFINITY.
+    if !len_sq.is_finite() || len_sq < 1e-12 {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
     }
     // glam DQuat::from_xyzw takes (x, y, z, w)
@@ -726,6 +727,16 @@ mod tests {
     fn test_comments_ignored() {
         let ops = parse_ops("// comment\nExtrude(5) /* block */ Taper(0.2)").unwrap();
         assert_eq!(ops.len(), 2);
+    }
+
+    // ── Issue 2: quaternion overflow bypass ───────────────────────────────────
+
+    #[test]
+    fn test_rotate_overflow_components_rejected() {
+        // Each component is finite, but squaring overflows to INFINITY.
+        // The len_sq check must catch this and reject the quaternion.
+        assert!(parse_ops("Rotate(1e160, 0, 0, 0)").is_err());
+        assert!(parse_ops("Rotate(1, 1e200, 0, 0)").is_err());
     }
 
     // ── Issue 1: split_top_level_pipe must ignore `|` inside quoted strings ────

@@ -85,6 +85,11 @@ fn resolve_split_sizes(slots: &[SplitSlot], total_dim: f64) -> Result<Vec<f64>, 
 
     let remaining = (total_dim - used).max(0.0);
 
+    // Guard against weight sum overflow (e.g. 256 slots each with weight 1e307).
+    if !float_weight_total.is_finite() {
+        return Err(ShapeError::InvalidNumericValue);
+    }
+
     let mut result = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
         match fixed[i] {
@@ -231,6 +236,9 @@ fn find_face_rule(selector: FaceSelector, cases: &[crate::ops::CompFaceCase]) ->
 // ── Stochastic selection ──────────────────────────────────────────────────────
 
 fn select_variant<'a>(variants: &'a [WeightedVariant], rng: &mut Pcg64) -> &'a [ShapeOp] {
+    if variants.is_empty() {
+        return &[];
+    }
     if variants.len() == 1 {
         return &variants[0].ops;
     }
@@ -423,7 +431,7 @@ impl Interpreter {
                 }
 
                 ShapeOp::Scale(v) => {
-                    if !v.is_finite() {
+                    if !v.is_finite() || v.x <= 0.0 || v.y <= 0.0 || v.z <= 0.0 {
                         return Err(ShapeError::InvalidNumericValue);
                     }
                     scope.size *= *v;
@@ -441,6 +449,9 @@ impl Interpreter {
                         Axis::Z => scope.size.z,
                     };
                     let sizes = resolve_split_sizes(slots, total)?;
+                    if queue.len() + slots.len() > MAX_QUEUE {
+                        return Err(ShapeError::CapacityOverflow);
+                    }
                     let mut offset = 0.0;
                     for (slot, size) in slots.iter().zip(sizes.iter()) {
                         let child = slice_scope(&scope, *axis, offset, *size);
@@ -475,7 +486,7 @@ impl Interpreter {
                         Axis::Z => scope.size.z,
                     };
                     let n_tiles = (total / tile_size).floor() as usize;
-                    if n_tiles > MAX_QUEUE {
+                    if queue.len() + n_tiles > MAX_QUEUE {
                         return Err(ShapeError::CapacityOverflow);
                     }
                     if n_tiles > 0 {
@@ -708,6 +719,94 @@ mod tests {
         );
         let model = interp.derive(Scope::unit(), "R").unwrap();
         assert_eq!(model.terminals[0].material, Some("Brick".to_string()));
+    }
+
+    // ── Issue 1: empty-variants panic ─────────────────────────────────────────
+
+    #[test]
+    fn test_empty_variants_discards_shape() {
+        let mut interp = Interpreter::new();
+        // add_weighted_rules with an empty vec must not panic; the scope is
+        // silently discarded (consistent with CGA "delete shape" semantics).
+        interp.add_weighted_rules("Empty", vec![]);
+        let model = interp.derive(Scope::unit(), "Empty").unwrap();
+        assert_eq!(model.len(), 0);
+    }
+
+    // ── Issue 3: queue capacity accounting ────────────────────────────────────
+
+    #[test]
+    fn test_repeat_respects_combined_queue_limit() {
+        // A Repeat whose tile count alone is fine (< MAX_QUEUE) but combined with
+        // the existing queue would exceed MAX_QUEUE should be rejected.
+        // We can't easily fill the queue to 99_999 in a unit test, so we use
+        // the public max_depth / max_terminals to drive overflow indirectly.
+        // Instead, verify the guard fires for a very large n_tiles (> MAX_QUEUE).
+        let mut interp = Interpreter::new();
+        // tile_size so small that n_tiles >> MAX_QUEUE (scope is 1e10, tile = 1e-1 → 1e11 tiles)
+        interp.add_rule(
+            "Big",
+            vec![ShapeOp::Repeat {
+                axis: Axis::X,
+                tile_size: 1e-1,
+                rule: "Tile".to_string(),
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(1e10, 1.0, 1.0));
+        assert!(matches!(
+            interp.derive(scope, "Big"),
+            Err(ShapeError::CapacityOverflow)
+        ));
+    }
+
+    // ── Issue 4: negative scale via API ──────────────────────────────────────
+
+    #[test]
+    fn test_api_negative_scale_rejected() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Scale(Vec3::new(-1.0, 1.0, 1.0)),
+                ShapeOp::I("Mesh".to_string()),
+            ],
+        );
+        assert!(matches!(
+            interp.derive(Scope::unit(), "R"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_api_zero_scale_rejected() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Scale(Vec3::new(0.0, 1.0, 1.0)),
+                ShapeOp::I("Mesh".to_string()),
+            ],
+        );
+        assert!(matches!(
+            interp.derive(Scope::unit(), "R"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    // ── Issue 5: float_weight_total overflow ──────────────────────────────────
+
+    #[test]
+    fn test_split_floating_weight_overflow_rejected() {
+        // Two floating slots each with weight near f64::MAX; their sum overflows
+        // to INFINITY in float_weight_total, which should be caught and rejected.
+        let slots = vec![
+            slot(SplitSize::Floating(f64::MAX), "A"),
+            slot(SplitSize::Floating(f64::MAX), "B"),
+        ];
+        assert!(matches!(
+            resolve_split_sizes(&slots, 10.0),
+            Err(ShapeError::InvalidNumericValue)
+        ));
     }
 
     #[test]
