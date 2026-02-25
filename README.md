@@ -145,6 +145,7 @@ The engine enforces hard caps to prevent runaway grammars:
 | Max ops per rule | 1 024 |
 | Max split slots | 256 |
 | Max comp cases | 32 |
+| Max rule variants (stochastic) | 64 |
 | Max identifier length | 64 chars |
 
 Exceeding a limit returns `Err(ShapeError::CapacityOverflow)` or

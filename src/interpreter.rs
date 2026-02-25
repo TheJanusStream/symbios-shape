@@ -111,7 +111,9 @@ fn resolve_split_sizes(slots: &[SplitSlot], total_dim: f64) -> Result<Vec<f64>, 
                 if float_weight_total <= 0.0 {
                     return Err(ShapeError::NoFloatingSlots);
                 }
-                result.push(remaining * w / float_weight_total);
+                // Compute the ratio first (≤ 1.0) to avoid an intermediate
+                // product overflow when both `remaining` and `w` are large.
+                result.push(remaining * (w / float_weight_total));
             }
         }
     }
@@ -892,6 +894,24 @@ mod tests {
         ));
     }
 
+    // ── Issue 1 (review #14): intermediate product overflow in floating split ──
+
+    #[test]
+    fn test_split_floating_large_remaining_no_overflow() {
+        // remaining ≈ 1e308, w = 2.0, float_weight_total = 3.0.
+        // Old code: (1e308 * 2.0) / 3.0 = INFINITY / 3.0 = INFINITY.
+        // Fixed:    1e308 * (2.0 / 3.0) = finite.
+        let slots = vec![
+            slot(SplitSize::Floating(2.0), "A"),
+            slot(SplitSize::Floating(1.0), "B"),
+        ];
+        let sizes = resolve_split_sizes(&slots, 1e308).unwrap();
+        assert!(sizes[0].is_finite(), "size[0] overflowed to {}", sizes[0]);
+        assert!(sizes[1].is_finite(), "size[1] overflowed to {}", sizes[1]);
+        // Proportions must be 2/3 and 1/3.
+        assert!((sizes[0] / sizes[1] - 2.0).abs() < 1e-6);
+    }
+
     // ── Issue 5: float_weight_total overflow ──────────────────────────────────
 
     #[test]
@@ -999,6 +1019,27 @@ mod tests {
             (pos(5) - Vec3::new(4.0, 0.0, 2.0)).length() < 1e-6,
             "Right pos"
         ); // at x=sx, origin shifted to (sx,0,sz)
+    }
+
+    // ── Issue 4 (review #14): negative scope size rejected by validate() ────────
+
+    #[test]
+    fn test_negative_scope_size_rejected() {
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(-1.0, 1.0, 1.0));
+        let interp = Interpreter::new();
+        assert!(matches!(
+            interp.derive(scope, "Anything"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_zero_scope_size_accepted() {
+        // Y=0 is a valid 2D footprint; derive should succeed (rule unknown → implicit terminal).
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 0.0, 10.0));
+        let interp = Interpreter::new();
+        let model = interp.derive(scope, "Footprint").unwrap();
+        assert_eq!(model.len(), 1);
     }
 
     // ── Issue 1 (review #11): unnormalized quaternion in root scope ───────────

@@ -19,7 +19,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while, take_while_m_n, take_while1},
     character::complete::{char as c_char, multispace1},
-    combinator::{map, verify},
+    combinator::{cut, map, verify},
     error::{Error, ErrorKind},
     multi::many0,
     number::complete::double,
@@ -35,6 +35,10 @@ const MAX_SPLIT_SLOTS: usize = 256;
 const MAX_COMP_CASES: usize = 32;
 const MAX_OPS: usize = 1024;
 const MAX_IDENTIFIER_LEN: usize = 64;
+/// Maximum number of stochastic variants in a single rule body (`A | B | C…`).
+/// Without this cap an attacker can force unbounded `Vec` allocations in
+/// `split_top_level_pipe` before any derivation-time guards can fire.
+pub const MAX_VARIANTS: usize = 64;
 
 // ── Whitespace & comments ────────────────────────────────────────────────────
 
@@ -193,7 +197,12 @@ fn parse_comp_face_case(input: &str) -> IResult<&str, CompFaceCase> {
 
 fn parse_extrude(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Extrude").parse(input)?;
-    let (input, h) = delimited(ws(c_char('(')), ws(finite_float), ws(c_char(')'))).parse(input)?;
+    let (input, h) = cut(delimited(
+        ws(c_char('(')),
+        ws(finite_float),
+        ws(c_char(')')),
+    ))
+    .parse(input)?;
     if h <= 0.0 {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
     }
@@ -202,8 +211,12 @@ fn parse_extrude(input: &str) -> IResult<&str, ShapeOp> {
 
 fn parse_taper(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Taper").parse(input)?;
-    let (input, amount) =
-        delimited(ws(c_char('(')), ws(finite_float), ws(c_char(')'))).parse(input)?;
+    let (input, amount) = cut(delimited(
+        ws(c_char('(')),
+        ws(finite_float),
+        ws(c_char(')')),
+    ))
+    .parse(input)?;
     if !(0.0..=1.0).contains(&amount) {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
     }
@@ -212,19 +225,19 @@ fn parse_taper(input: &str) -> IResult<&str, ShapeOp> {
 
 fn parse_rotate(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Rotate").parse(input)?;
-    let (input, q) = ws(parse_quat).parse(input)?;
+    let (input, q) = cut(ws(parse_quat)).parse(input)?;
     Ok((input, ShapeOp::Rotate(q)))
 }
 
 fn parse_translate(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Translate").parse(input)?;
-    let (input, v) = ws(parse_vec3).parse(input)?;
+    let (input, v) = cut(ws(parse_vec3)).parse(input)?;
     Ok((input, ShapeOp::Translate(v)))
 }
 
 fn parse_scale(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Scale").parse(input)?;
-    let (input, v) = ws(parse_vec3).parse(input)?;
+    let (input, v) = cut(ws(parse_vec3)).parse(input)?;
     if v.x <= 0.0 || v.y <= 0.0 || v.z <= 0.0 {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
     }
@@ -233,12 +246,13 @@ fn parse_scale(input: &str) -> IResult<&str, ShapeOp> {
 
 fn parse_split(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Split").parse(input)?;
-    let (input, _) = ws(c_char('(')).parse(input)?;
-    let (input, axis) = ws(parse_axis).parse(input)?;
-    let (input, _) = ws(c_char(')')).parse(input)?;
-    let (input, _) = ws(c_char('{')).parse(input)?;
+    // After the "Split" keyword is consumed, any argument error is fatal.
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, axis) = cut(ws(parse_axis)).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
     // Bounded list: cap allocation before it happens (DoS guard).
-    let (mut remaining, first) = ws(parse_split_slot).parse(input)?;
+    let (mut remaining, first) = cut(ws(parse_split_slot)).parse(input)?;
     let mut slots = vec![first];
     loop {
         if slots.len() >= MAX_SPLIT_SLOTS {
@@ -268,14 +282,15 @@ fn parse_split(input: &str) -> IResult<&str, ShapeOp> {
 
 fn parse_repeat(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Repeat").parse(input)?;
-    let (input, _) = ws(c_char('(')).parse(input)?;
-    let (input, axis) = ws(parse_axis).parse(input)?;
-    let (input, _) = ws(c_char(',')).parse(input)?;
-    let (input, tile_size) = ws(finite_float).parse(input)?;
-    let (input, _) = ws(c_char(')')).parse(input)?;
-    let (input, _) = ws(c_char('{')).parse(input)?;
-    let (input, rule) = ws(rule_name).parse(input)?;
-    let (input, _) = ws(c_char('}')).parse(input)?;
+    // After the "Repeat" keyword is consumed, any argument error is fatal.
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, axis) = cut(ws(parse_axis)).parse(input)?;
+    let (input, _) = cut(ws(c_char(','))).parse(input)?;
+    let (input, tile_size) = cut(ws(finite_float)).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
+    let (input, rule) = cut(ws(rule_name)).parse(input)?;
+    let (input, _) = cut(ws(c_char('}'))).parse(input)?;
     if tile_size <= 0.0 {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
     }
@@ -291,13 +306,14 @@ fn parse_repeat(input: &str) -> IResult<&str, ShapeOp> {
 
 fn parse_comp(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Comp").parse(input)?;
-    let (input, _) = ws(c_char('(')).parse(input)?;
-    let (input, kind) = ws(tag("Faces")).parse(input)?;
+    // After the "Comp" keyword is consumed, any argument error is fatal.
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, kind) = cut(ws(tag("Faces"))).parse(input)?;
     let _ = kind; // only Faces supported in v0.1
-    let (input, _) = ws(c_char(')')).parse(input)?;
-    let (input, _) = ws(c_char('{')).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
     // Bounded list: cap allocation before it happens (DoS guard).
-    let (mut remaining, first) = ws(parse_comp_face_case).parse(input)?;
+    let (mut remaining, first) = cut(ws(parse_comp_face_case)).parse(input)?;
     let mut cases = vec![first];
     loop {
         if cases.len() >= MAX_COMP_CASES {
@@ -328,7 +344,7 @@ fn parse_comp(input: &str) -> IResult<&str, ShapeOp> {
 fn parse_instance(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("I").parse(input)?;
     let (input, mesh_id) =
-        delimited(ws(c_char('(')), ws(rule_name), ws(c_char(')'))).parse(input)?;
+        cut(delimited(ws(c_char('(')), ws(rule_name), ws(c_char(')')))).parse(input)?;
     Ok((input, ShapeOp::I(mesh_id)))
 }
 
@@ -336,7 +352,7 @@ fn parse_instance(input: &str) -> IResult<&str, ShapeOp> {
 fn parse_mat(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Mat").parse(input)?;
     let (input, mat_id) =
-        delimited(ws(c_char('(')), ws(rule_name), ws(c_char(')'))).parse(input)?;
+        cut(delimited(ws(c_char('(')), ws(rule_name), ws(c_char(')')))).parse(input)?;
     Ok((input, ShapeOp::Mat(mat_id)))
 }
 
@@ -433,11 +449,14 @@ pub fn parse_ops(input: &str) -> Result<Vec<ShapeOp>, ShapeError> {
 /// Splits `s` on `|` characters at brace depth 0, respecting quoted strings
 /// and comments so that `|` inside `"Wall|Door"` or `/* { */` is ignored.
 ///
+/// Returns at most [`MAX_VARIANTS`] parts; exceeding that limit returns
+/// `Err(CapacityOverflow)` before any further allocation occurs.
+///
 /// Contexts handled:
 /// - `"..."` string literals — `|` and `{`/`}` inside are invisible.
 /// - `/* ... */` block comments — same.
 /// - `// ...` line comments — same (skipped until `\n` or `\r`).
-fn split_top_level_pipe(s: &str) -> Vec<&str> {
+fn split_top_level_pipe(s: &str) -> Result<Vec<&str>, ShapeError> {
     let mut depth: i32 = 0;
     let mut in_string = false;
     let mut in_block_comment = false;
@@ -494,6 +513,12 @@ fn split_top_level_pipe(s: &str) -> Vec<&str> {
             '{' => depth += 1,
             '}' => depth -= 1,
             '|' if depth == 0 => {
+                // After this push, `parts.len() + 1` parts exist; the loop's
+                // final push adds one more, giving `parts.len() + 2` total.
+                // Reject before the push when that would exceed MAX_VARIANTS.
+                if parts.len() + 2 > MAX_VARIANTS {
+                    return Err(ShapeError::CapacityOverflow);
+                }
                 parts.push(s[start..byte_pos].trim());
                 start = byte_pos + c.len_utf8();
             }
@@ -502,7 +527,7 @@ fn split_top_level_pipe(s: &str) -> Vec<&str> {
     }
 
     parts.push(s[start..].trim());
-    parts
+    Ok(parts)
 }
 
 fn parse_weight_prefix(input: &str) -> IResult<&str, f64> {
@@ -562,7 +587,7 @@ pub fn parse_rule(input: &str) -> Result<GrammarRule, ShapeError> {
         .map_err(|e| ShapeError::ParseError(e.to_string()))?;
 
     // Split the body on top-level `|` to detect stochastic alternatives.
-    let parts = split_top_level_pipe(remaining);
+    let parts = split_top_level_pipe(remaining)?;
 
     let variants = if parts.len() > 1 {
         // Multiple alternatives: each must start with `weight%`
@@ -784,6 +809,49 @@ mod tests {
     #[test]
     fn test_ops_after_split_rejected() {
         assert!(parse_ops("Split(Y) { ~1: A | ~1: B } Scale(1, 2, 1)").is_err());
+    }
+
+    // ── Issue 3 (review #14): MAX_VARIANTS cap in stochastic rule parsing ───────
+
+    #[test]
+    fn test_too_many_variants_rejected() {
+        // Build a rule body with MAX_VARIANTS + 1 alternatives.
+        let variants: Vec<String> = (0..=MAX_VARIANTS).map(|i| format!("1% I(M{i})")).collect();
+        let rule_str = format!("R --> {}", variants.join(" | "));
+        assert!(matches!(
+            parse_rule(&rule_str),
+            Err(ShapeError::CapacityOverflow)
+        ));
+    }
+
+    #[test]
+    fn test_max_variants_boundary_accepted() {
+        // Exactly MAX_VARIANTS alternatives must succeed.
+        let variants: Vec<String> = (0..MAX_VARIANTS).map(|i| format!("1% I(M{i})")).collect();
+        let rule_str = format!("R --> {}", variants.join(" | "));
+        let rule = parse_rule(&rule_str).unwrap();
+        assert_eq!(rule.variants.len(), MAX_VARIANTS);
+    }
+
+    // ── Issue 2 (review #14): cut prevents backtracking on malformed op args ───
+
+    #[test]
+    fn test_translate_wrong_arg_count_rejected() {
+        // Before cut: "Translate" would backtrack to parse_rule_ref, producing a
+        // misleading "unreachable operations after terminal" error.
+        // After cut: immediately fatal once "Translate" tag is consumed.
+        assert!(parse_ops("Translate(1.0, 2.0)").is_err());
+    }
+
+    #[test]
+    fn test_extrude_missing_arg_rejected() {
+        assert!(parse_ops("Extrude()").is_err());
+    }
+
+    #[test]
+    fn test_split_missing_brace_rejected() {
+        // "Split(Y)" without a body should be a fatal parse error, not a rule ref.
+        assert!(parse_ops("Split(Y)").is_err());
     }
 
     // ── Issue 3: single-variant stochastic rule (100% prefix) ─────────────────

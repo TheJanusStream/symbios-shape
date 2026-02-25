@@ -39,13 +39,24 @@ impl Scope {
         }
     }
 
-    /// Returns `Ok(())` if all fields are finite and the rotation is a unit quaternion.
-    /// Returns `Err(InvalidNumericValue)` otherwise.
+    /// Returns `Ok(())` if all fields are finite, the rotation is a unit quaternion,
+    /// and no size component is negative.
+    ///
+    /// Zero size components are permitted: a root scope may have Y = 0 before
+    /// `Extrude` sets its height, and face scopes produced by `Comp(Faces)` carry
+    /// Z = 0 (they are 2-D canvases). Negative sizes, however, have no valid
+    /// interpretation and are rejected here before they can silently corrupt
+    /// downstream operations such as `Split`.
+    ///
+    /// Returns `Err(InvalidNumericValue)` on any violation.
     pub fn validate(&self) -> Result<(), ShapeError> {
         if !self.position.is_finite() || !self.rotation.is_finite() || !self.size.is_finite() {
             return Err(ShapeError::InvalidNumericValue);
         }
         if !self.rotation.is_normalized() {
+            return Err(ShapeError::InvalidNumericValue);
+        }
+        if self.size.x < 0.0 || self.size.y < 0.0 || self.size.z < 0.0 {
             return Err(ShapeError::InvalidNumericValue);
         }
         Ok(())
