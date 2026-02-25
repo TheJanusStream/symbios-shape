@@ -306,16 +306,24 @@ impl Interpreter {
     ///
     /// `variants` is a list of `(relative_weight, ops)` pairs. Weights need not
     /// sum to 1.0 — they are normalised internally during selection.
+    ///
+    /// Returns `Err(InvalidNumericValue)` if any weight is non-finite or negative.
     pub fn add_weighted_rules(
         &mut self,
         name: impl Into<String>,
         variants: Vec<(f64, Vec<ShapeOp>)>,
-    ) {
+    ) -> Result<(), ShapeError> {
+        for (weight, _) in &variants {
+            if !weight.is_finite() || *weight < 0.0 {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+        }
         let wvs = variants
             .into_iter()
             .map(|(weight, ops)| WeightedVariant { weight, ops })
             .collect();
         self.rules.insert(name.into(), wvs);
+        Ok(())
     }
 
     /// Returns true if a rule with `name` is registered.
@@ -427,7 +435,14 @@ impl Interpreter {
                     if !q.is_finite() {
                         return Err(ShapeError::InvalidNumericValue);
                     }
-                    scope.rotation *= *q;
+                    // Reject degenerate (near-zero) quaternions that cannot represent a
+                    // rotation. Normalize non-unit inputs so that glam's fast-path
+                    // `rotation * vec` (which assumes a unit quaternion) is correct.
+                    let len_sq = q.length_squared();
+                    if !len_sq.is_finite() || len_sq < 1e-12 {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
+                    scope.rotation = (scope.rotation * q.normalize()).normalize();
                 }
 
                 ShapeOp::Translate(v) => {
@@ -750,7 +765,7 @@ mod tests {
         let mut interp = Interpreter::new();
         // add_weighted_rules with an empty vec must not panic; the scope is
         // silently discarded (consistent with CGA "delete shape" semantics).
-        interp.add_weighted_rules("Empty", vec![]);
+        interp.add_weighted_rules("Empty", vec![]).unwrap();
         let model = interp.derive(Scope::unit(), "Empty").unwrap();
         assert_eq!(model.len(), 0);
     }
@@ -893,13 +908,15 @@ mod tests {
     #[test]
     fn test_stochastic_rule_deterministic_with_seed() {
         let mut interp = Interpreter::new();
-        interp.add_weighted_rules(
-            "Facade",
-            vec![
-                (70.0, vec![ShapeOp::I("Brick".to_string())]),
-                (30.0, vec![ShapeOp::I("Glass".to_string())]),
-            ],
-        );
+        interp
+            .add_weighted_rules(
+                "Facade",
+                vec![
+                    (70.0, vec![ShapeOp::I("Brick".to_string())]),
+                    (30.0, vec![ShapeOp::I("Glass".to_string())]),
+                ],
+            )
+            .unwrap();
         interp.seed = 42;
         // Same seed → same result
         let m1 = interp.derive(Scope::unit(), "Facade").unwrap();
@@ -979,5 +996,86 @@ mod tests {
             (pos(5) - Vec3::new(4.0, 0.0, 2.0)).length() < 1e-6,
             "Right pos"
         ); // at x=sx, origin shifted to (sx,0,sz)
+    }
+
+    // ── Issue 1 (review #11): unnormalized quaternion in root scope ───────────
+
+    #[test]
+    fn test_unnormalized_root_quat_rejected() {
+        // DQuat::from_xyzw(2,0,0,0) is finite but has length 2 — not a unit quat.
+        let bad_q = Quat::from_xyzw(0.0, 0.0, 0.0, 2.0);
+        let scope = Scope::new(Vec3::ZERO, bad_q, Vec3::ONE);
+        let interp = Interpreter::new();
+        assert!(matches!(
+            interp.derive(scope, "Anything"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_degenerate_rotate_op_rejected() {
+        // A zero quaternion (len_sq < 1e-12) cannot represent a rotation — must reject.
+        let zero_q = Quat::from_xyzw(0.0, 0.0, 0.0, 0.0);
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Rotate(zero_q), ShapeOp::I("M".to_string())],
+        );
+        assert!(matches!(
+            interp.derive(Scope::unit(), "R"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_scaled_rotate_op_normalized() {
+        // A quaternion with magnitude 2 (e.g. IDENTITY * 2) is non-unit but valid;
+        // it must be normalised to IDENTITY rather than rejected.
+        let scaled_q = Quat::from_xyzw(0.0, 0.0, 0.0, 2.0); // IDENTITY * 2
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Rotate(scaled_q), ShapeOp::I("M".to_string())],
+        );
+        // Should succeed; the terminal scope rotation should be IDENTITY.
+        let model = interp.derive(Scope::unit(), "R").unwrap();
+        assert_eq!(model.len(), 1);
+        let r = model.terminals[0].scope.rotation;
+        assert!(
+            (r.length_squared() - 1.0).abs() < 1e-9,
+            "rotation should be unit"
+        );
+    }
+
+    // ── Issue 2 (review #12): invalid weights in add_weighted_rules ──────────
+
+    #[test]
+    fn test_nan_weight_rejected() {
+        let mut interp = Interpreter::new();
+        assert!(matches!(
+            interp.add_weighted_rules("R", vec![(f64::NAN, vec![ShapeOp::I("M".to_string())])]),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_infinite_weight_rejected() {
+        let mut interp = Interpreter::new();
+        assert!(matches!(
+            interp.add_weighted_rules(
+                "R",
+                vec![(f64::INFINITY, vec![ShapeOp::I("M".to_string())])]
+            ),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    #[test]
+    fn test_negative_weight_rejected() {
+        let mut interp = Interpreter::new();
+        assert!(matches!(
+            interp.add_weighted_rules("R", vec![(-1.0, vec![ShapeOp::I("M".to_string())])]),
+            Err(ShapeError::InvalidNumericValue)
+        ));
     }
 }

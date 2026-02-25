@@ -43,6 +43,9 @@ impl Scope {
         if !self.position.is_finite() || !self.rotation.is_finite() || !self.size.is_finite() {
             return Err(ShapeError::InvalidNumericValue);
         }
+        if !self.rotation.is_normalized() {
+            return Err(ShapeError::InvalidNumericValue);
+        }
         Ok(())
     }
 
