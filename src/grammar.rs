@@ -17,11 +17,11 @@
 use nom::{
     IResult, Parser,
     branch::alt,
-    bytes::complete::{is_not, tag, take_until, take_while, take_while1},
+    bytes::complete::{tag, take_until, take_while, take_while_m_n, take_while1},
     character::complete::{char as c_char, multispace1},
-    combinator::{map, opt, verify},
+    combinator::{map, verify},
     error::{Error, ErrorKind},
-    multi::{many0, separated_list1},
+    multi::many0,
     number::complete::double,
     sequence::{delimited, preceded, terminated},
 };
@@ -43,7 +43,9 @@ fn space_or_comment<'a, E: nom::error::ParseError<&'a str>>(
 ) -> IResult<&'a str, (), E> {
     let comment = alt((
         preceded(tag("/*"), terminated(take_until("*/"), tag("*/"))),
-        preceded(tag("//"), is_not("\n\r")),
+        // take_while (unlike is_not) accepts empty input, so `// EOF` without a
+        // trailing newline parses correctly instead of returning a fatal error.
+        preceded(tag("//"), take_while(|c: char| c != '\n' && c != '\r')),
     ));
     let mut p = many0(alt((map(multispace1, |_| ()), map(comment, |_| ()))));
     p.parse(input).map(|(i, _)| (i, ()))
@@ -84,10 +86,18 @@ fn identifier(input: &str) -> IResult<&str, &str> {
 }
 
 /// Parses an identifier OR a quoted string literal `"name"`.
+///
+/// Quoted strings are limited to `MAX_IDENTIFIER_LEN` characters via
+/// `take_while_m_n`: the scan stops at the limit, causing `c_char('"')` to
+/// fail for oversized inputs before any allocation occurs.
 fn rule_name(input: &str) -> IResult<&str, String> {
     alt((
         map(
-            delimited(c_char('"'), take_while(|c| c != '"'), c_char('"')),
+            delimited(
+                c_char('"'),
+                take_while_m_n(0, MAX_IDENTIFIER_LEN, |c: char| c != '"'),
+                c_char('"'),
+            ),
             |s: &str| s.to_string(),
         ),
         map(ws(identifier), |s: &str| s.to_string()),
@@ -131,8 +141,14 @@ fn parse_quat(input: &str) -> IResult<&str, Quat> {
     let (input, _) = ws(c_char(',')).parse(input)?;
     let (input, z) = ws(finite_float).parse(input)?;
     let (input, _) = ws(c_char(')')).parse(input)?;
+    // glam requires unit quaternions; normalize the user-supplied values.
+    // Reject degenerate (near-zero) inputs that cannot be normalized.
+    let len_sq = x * x + y * y + z * z + w * w;
+    if len_sq < 1e-12 {
+        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+    }
     // glam DQuat::from_xyzw takes (x, y, z, w)
-    Ok((input, Quat::from_xyzw(x, y, z, w)))
+    Ok((input, Quat::from_xyzw(x, y, z, w).normalize()))
 }
 
 // ── Split sizes ───────────────────────────────────────────────────────────────
@@ -214,13 +230,33 @@ fn parse_split(input: &str) -> IResult<&str, ShapeOp> {
     let (input, axis) = ws(parse_axis).parse(input)?;
     let (input, _) = ws(c_char(')')).parse(input)?;
     let (input, _) = ws(c_char('{')).parse(input)?;
-    let (input, slots) = separated_list1(ws(c_char('|')), ws(parse_split_slot)).parse(input)?;
-    let (input, _) = opt(ws(c_char('|'))).parse(input)?;
-    let (input, _) = ws(c_char('}')).parse(input)?;
-    if slots.len() > MAX_SPLIT_SLOTS {
-        return Err(nom::Err::Failure(Error::new(input, ErrorKind::TooLarge)));
+    // Bounded list: cap allocation before it happens (DoS guard).
+    let (mut remaining, first) = ws(parse_split_slot).parse(input)?;
+    let mut slots = vec![first];
+    loop {
+        if slots.len() >= MAX_SPLIT_SLOTS {
+            return Err(nom::Err::Failure(Error::new(
+                remaining,
+                ErrorKind::TooLarge,
+            )));
+        }
+        let Ok((after_sep, _)) = ws::<_, _, Error<&str>>(c_char('|')).parse(remaining) else {
+            break;
+        };
+        match ws(parse_split_slot).parse(after_sep) {
+            Ok((after_item, slot)) => {
+                slots.push(slot);
+                remaining = after_item;
+            }
+            Err(nom::Err::Failure(e)) => return Err(nom::Err::Failure(e)),
+            Err(_) => {
+                remaining = after_sep; // trailing `|` — consume separator, stop
+                break;
+            }
+        }
     }
-    Ok((input, ShapeOp::Split { axis, slots }))
+    let (remaining, _) = ws(c_char('}')).parse(remaining)?;
+    Ok((remaining, ShapeOp::Split { axis, slots }))
 }
 
 fn parse_repeat(input: &str) -> IResult<&str, ShapeOp> {
@@ -253,13 +289,33 @@ fn parse_comp(input: &str) -> IResult<&str, ShapeOp> {
     let _ = kind; // only Faces supported in v0.1
     let (input, _) = ws(c_char(')')).parse(input)?;
     let (input, _) = ws(c_char('{')).parse(input)?;
-    let (input, cases) = separated_list1(ws(c_char('|')), ws(parse_comp_face_case)).parse(input)?;
-    let (input, _) = opt(ws(c_char('|'))).parse(input)?;
-    let (input, _) = ws(c_char('}')).parse(input)?;
-    if cases.len() > MAX_COMP_CASES {
-        return Err(nom::Err::Failure(Error::new(input, ErrorKind::TooLarge)));
+    // Bounded list: cap allocation before it happens (DoS guard).
+    let (mut remaining, first) = ws(parse_comp_face_case).parse(input)?;
+    let mut cases = vec![first];
+    loop {
+        if cases.len() >= MAX_COMP_CASES {
+            return Err(nom::Err::Failure(Error::new(
+                remaining,
+                ErrorKind::TooLarge,
+            )));
+        }
+        let Ok((after_sep, _)) = ws::<_, _, Error<&str>>(c_char('|')).parse(remaining) else {
+            break;
+        };
+        match ws(parse_comp_face_case).parse(after_sep) {
+            Ok((after_item, case)) => {
+                cases.push(case);
+                remaining = after_item;
+            }
+            Err(nom::Err::Failure(e)) => return Err(nom::Err::Failure(e)),
+            Err(_) => {
+                remaining = after_sep; // trailing `|` — consume separator, stop
+                break;
+            }
+        }
     }
-    Ok((input, ShapeOp::Comp(CompTarget::Faces(cases))))
+    let (remaining, _) = ws(c_char('}')).parse(remaining)?;
+    Ok((remaining, ShapeOp::Comp(CompTarget::Faces(cases))))
 }
 
 fn parse_instance(input: &str) -> IResult<&str, ShapeOp> {

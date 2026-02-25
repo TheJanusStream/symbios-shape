@@ -157,18 +157,20 @@ fn face_descs(scope_size: Vec3) -> [(FaceSelector, Vec3, Vec3, Quat); 6] {
             Quat::from_axis_angle(Vec3::X, FRAC_PI_2),
         ),
         // Top: normal = +Y (at y = sy)
-        // from_axis_angle(X, -π/2): local Z → world +Y
+        // from_axis_angle(X, -π/2): local Z → world +Y, local Y → world -Z
+        // Origin at (0, sy, sz): as local Y increases, world Z decreases from sz to 0.
         (
             FaceSelector::Top,
-            Vec3::new(0.0, sy, 0.0),
+            Vec3::new(0.0, sy, sz),
             Vec3::new(sx, sz, 0.0),
             Quat::from_axis_angle(Vec3::X, -FRAC_PI_2),
         ),
         // Front: normal = -Z (at z = 0)
-        // from_axis_angle(Y, π): local Z → world -Z
+        // from_axis_angle(Y, π): local Z → world -Z, local X → world -X
+        // Origin at (sx, 0, 0): as local X increases, world X decreases from sx to 0.
         (
             FaceSelector::Front,
-            Vec3::ZERO,
+            Vec3::new(sx, 0.0, 0.0),
             Vec3::new(sx, sy, 0.0),
             Quat::from_axis_angle(Vec3::Y, PI),
         ),
@@ -189,10 +191,11 @@ fn face_descs(scope_size: Vec3) -> [(FaceSelector, Vec3, Vec3, Quat); 6] {
             Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
         ),
         // Right: normal = +X (at x = sx)
-        // from_axis_angle(Y, +π/2): local Z → world +X
+        // from_axis_angle(Y, +π/2): local Z → world +X, local X → world -Z
+        // Origin at (sx, 0, sz): as local X increases, world Z decreases from sz to 0.
         (
             FaceSelector::Right,
-            Vec3::new(sx, 0.0, 0.0),
+            Vec3::new(sx, 0.0, sz),
             Vec3::new(sz, sy, 0.0),
             Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
         ),
@@ -472,6 +475,9 @@ impl Interpreter {
                         Axis::Z => scope.size.z,
                     };
                     let n_tiles = (total / tile_size).floor() as usize;
+                    if n_tiles > MAX_QUEUE {
+                        return Err(ShapeError::CapacityOverflow);
+                    }
                     if n_tiles > 0 {
                         let actual_size = total / n_tiles as f64;
                         for i in 0..n_tiles {
@@ -764,5 +770,34 @@ mod tests {
                 normals
             );
         }
+
+        // face_descs order is deterministic: Bottom, Top, Front, Back, Left, Right.
+        // Verify that the face origin positions lie on the correct parent faces.
+        // scope: position=(0,0,0), size sx=4, sy=3, sz=2.
+        let pos = |i: usize| model.terminals[i].scope.position;
+        assert!(
+            (pos(0) - Vec3::new(0.0, 0.0, 0.0)).length() < 1e-6,
+            "Bottom pos"
+        ); // at y=0
+        assert!(
+            (pos(1) - Vec3::new(0.0, 3.0, 2.0)).length() < 1e-6,
+            "Top pos"
+        ); // at y=sy, origin shifted to (0,sy,sz)
+        assert!(
+            (pos(2) - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-6,
+            "Front pos"
+        ); // at z=0, origin shifted to (sx,0,0)
+        assert!(
+            (pos(3) - Vec3::new(0.0, 0.0, 2.0)).length() < 1e-6,
+            "Back pos"
+        ); // at z=sz
+        assert!(
+            (pos(4) - Vec3::new(0.0, 0.0, 0.0)).length() < 1e-6,
+            "Left pos"
+        ); // at x=0
+        assert!(
+            (pos(5) - Vec3::new(4.0, 0.0, 2.0)).length() < 1e-6,
+            "Right pos"
+        ); // at x=sx, origin shifted to (sx,0,sz)
     }
 }
