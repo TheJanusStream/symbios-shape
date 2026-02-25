@@ -3,7 +3,9 @@
 /// The interpreter owns a set of named rules. Each rule has one or more
 /// weighted variants — for deterministic rules there is exactly one variant.
 /// Derivation starts from a root `Scope` and root rule name, expanding rules
-/// breadth-first until every branch terminates with an `I(mesh)` terminal.
+/// breadth-first until every branch terminates. Branches terminate either via
+/// an explicit `I(mesh_id)` op or by referencing an unknown rule name, which
+/// is treated as an implicit `I(rule_name)` terminal ("leaf shorthand").
 use std::collections::{HashMap, VecDeque};
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -334,8 +336,9 @@ impl Interpreter {
     /// Derives the shape model starting from `root_scope` and `root_rule`.
     ///
     /// Uses a breadth-first work queue to expand rules until all branches
-    /// terminate. A fresh RNG seeded from `self.seed` is created for each call,
-    /// making derivations reproducible for the same `seed` value.
+    /// terminate via `I(mesh_id)` or an unknown rule name (implicit terminal).
+    /// A fresh RNG seeded from `self.seed` is created for each call, making
+    /// derivations reproducible for the same `seed` value.
     pub fn derive(
         &self,
         root_scope: Scope,

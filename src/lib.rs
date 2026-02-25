@@ -9,7 +9,7 @@
 //!
 //! ## Key Features
 //!
-//! - **Sovereign Architecture**: No heavy math or engine dependencies.
+//! - **Lightweight**: Depends only on `glam` (math), `nom` (parsing), and `rand` (stochastic rules) — no engine or runtime required.
 //! - **CGA-Compatible Operations**: `Extrude`, `Split`, `Comp`, `Repeat`, `I`, and more.
 //! - **Flexible Split Sizing**: Absolute, relative (`'`), and floating (`~`) modes.
 //! - **Bevy-Ready Output**: `ShapeModel` containing `Terminal` nodes (scope + mesh_id).

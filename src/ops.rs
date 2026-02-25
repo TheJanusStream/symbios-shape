@@ -112,8 +112,9 @@ pub enum ShapeOp {
     /// Divides the scope along `axis` into ordered slots.
     Split { axis: Axis, slots: Vec<SplitSlot> },
 
-    /// Tiles the scope along `axis` with a child scope of size `tile_size`.
-    /// Emits as many complete tiles as fit; any remainder is discarded.
+    /// Tiles the scope along `axis` with child scopes of approximate size `tile_size`.
+    /// The tile count is `floor(total / tile_size)`; the actual tile size is then
+    /// stretched to `total / count` so the tiles fill the scope exactly with no gap.
     Repeat {
         axis: Axis,
         tile_size: f64,

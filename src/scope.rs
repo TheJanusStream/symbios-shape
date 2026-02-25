@@ -39,6 +39,8 @@ impl Scope {
         }
     }
 
+    /// Returns `Ok(())` if all fields are finite and the rotation is a unit quaternion.
+    /// Returns `Err(InvalidNumericValue)` otherwise.
     pub fn validate(&self) -> Result<(), ShapeError> {
         if !self.position.is_finite() || !self.rotation.is_finite() || !self.size.is_finite() {
             return Err(ShapeError::InvalidNumericValue);
