@@ -147,73 +147,70 @@ fn slice_scope(parent: &Scope, axis: Axis, offset: f64, size: f64) -> Scope {
 
 /// All six canonical faces of an OBB, each with a proper outward-facing orientation.
 ///
+/// **Convention:** Local **Y** points along the outward normal.
+///
+/// This allows `Extrude(h)` (which modifies Y) to always extrude "outward" from
+/// the face, creating valid 3D volumes from 2D faces.
+///
 /// Each entry: `(selector, local_offset, face_size, rotation_delta)`.
-///
-/// The `rotation_delta` is composed with the parent rotation so that the resulting
-/// face scope has:
-/// - Local **Z** = outward face normal
-/// - Local **X** = face width tangent
-/// - Local **Y** = face height tangent
-/// - `size.z = 0` (the face is a 2-D canvas)
-///
-/// This allows rules like `Repeat(X) { Window }` to work naturally on any side
-/// of a building after `Comp(Faces)`.
+/// `face_size` uses Y=0 (flattened). The dimensions are mapped to X and Z.
 fn face_descs(scope_size: Vec3) -> [(FaceSelector, Vec3, Vec3, Quat); 6] {
     let sx = scope_size.x;
     let sy = scope_size.y;
     let sz = scope_size.z;
 
     [
-        // Bottom: normal = -Y (at y = 0)
-        // from_axis_angle(X, +π/2): local Z → world -Y
+        // Bottom: normal = -Y
+        // Rotate 180° around Z: Y -> -Y, X -> -X.
+        // Origin starts at (sx, 0, 0) to compensate for X reversal.
         (
             FaceSelector::Bottom,
-            Vec3::ZERO,
-            Vec3::new(sx, sz, 0.0),
-            Quat::from_axis_angle(Vec3::X, FRAC_PI_2),
+            Vec3::new(sx, 0.0, 0.0),
+            Vec3::new(sx, 0.0, sz),
+            Quat::from_axis_angle(Vec3::Z, PI),
         ),
-        // Top: normal = +Y (at y = sy)
-        // from_axis_angle(X, -π/2): local Z → world +Y, local Y → world -Z
-        // Origin at (0, sy, sz): as local Y increases, world Z decreases from sz to 0.
+        // Top: normal = +Y
+        // Identity: Y is already Up.
         (
             FaceSelector::Top,
-            Vec3::new(0.0, sy, sz),
-            Vec3::new(sx, sz, 0.0),
-            Quat::from_axis_angle(Vec3::X, -FRAC_PI_2),
-        ),
-        // Front: normal = -Z (at z = 0)
-        // from_axis_angle(Y, π): local Z → world -Z, local X → world -X
-        // Origin at (sx, 0, 0): as local X increases, world X decreases from sx to 0.
-        (
-            FaceSelector::Front,
-            Vec3::new(sx, 0.0, 0.0),
-            Vec3::new(sx, sy, 0.0),
-            Quat::from_axis_angle(Vec3::Y, PI),
-        ),
-        // Back: normal = +Z (at z = sz)
-        // identity: local Z → world +Z
-        (
-            FaceSelector::Back,
-            Vec3::new(0.0, 0.0, sz),
-            Vec3::new(sx, sy, 0.0),
+            Vec3::new(0.0, sy, 0.0),
+            Vec3::new(sx, 0.0, sz),
             Quat::IDENTITY,
         ),
-        // Left: normal = -X (at x = 0)
-        // from_axis_angle(Y, -π/2): local Z → world -X
+        // Front: normal = -Z
+        // Rotate -90° around X: Y -> -Z, Z -> Y.
+        (
+            FaceSelector::Front,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(sx, 0.0, sy),
+            Quat::from_axis_angle(Vec3::X, -FRAC_PI_2),
+        ),
+        // Back: normal = +Z
+        // Rotate +90° around X: Y -> Z, Z -> -Y.
+        // Origin shift to (0, sy, sz) to align 0..sy with Z..0.
+        (
+            FaceSelector::Back,
+            Vec3::new(0.0, sy, sz),
+            Vec3::new(sx, 0.0, sy),
+            Quat::from_axis_angle(Vec3::X, FRAC_PI_2),
+        ),
+        // Left: normal = -X
+        // Rotate +90° around Z: Y -> -X, X -> Y.
+        // Origin shift to (0, 0, 0).
         (
             FaceSelector::Left,
-            Vec3::ZERO,
-            Vec3::new(sz, sy, 0.0),
-            Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(sy, 0.0, sz),
+            Quat::from_axis_angle(Vec3::Z, FRAC_PI_2),
         ),
-        // Right: normal = +X (at x = sx)
-        // from_axis_angle(Y, +π/2): local Z → world +X, local X → world -Z
-        // Origin at (sx, 0, sz): as local X increases, world Z decreases from sz to 0.
+        // Right: normal = +X
+        // Rotate -90° around Z: Y -> X, X -> -Y.
+        // Origin shift to (sx, sy, 0).
         (
             FaceSelector::Right,
-            Vec3::new(sx, 0.0, sz),
-            Vec3::new(sz, sy, 0.0),
-            Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
+            Vec3::new(sx, sy, 0.0),
+            Vec3::new(sy, 0.0, sz),
+            Quat::from_axis_angle(Vec3::Z, -FRAC_PI_2),
         ),
     ]
 }
