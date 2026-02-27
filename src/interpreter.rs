@@ -685,7 +685,7 @@ impl Interpreter {
                         return Err(ShapeError::InvalidNumericValue);
                     }
                     let sx = scope.size.x;
-                    let sy = scope.size.y;
+                    let _sy = scope.size.y;
                     let sz = scope.size.z;
                     let o = *overhang;
                     let alpha = angle.to_radians();
@@ -705,7 +705,7 @@ impl Interpreter {
                     type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, f64);
                     let panels: Vec<Panel> = match roof_type {
                         RoofType::Shed => vec![(
-                            Vec3::new(sx + o, sy, -o),
+                            Vec3::new(sx + o, 0.0, -o),
                             Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
                             front_rot,
                             RoofFaceSelector::Slope,
@@ -713,28 +713,28 @@ impl Interpreter {
                         )],
                         RoofType::Pyramid => vec![
                             (
-                                Vec3::new(sx + o, sy, -o),
+                                Vec3::new(sx + o, 0.0, -o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 front_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(-o, sy, sz + o),
+                                Vec3::new(-o, 0.0, sz + o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 back_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(-o, sy, -o),
+                                Vec3::new(-o, 0.0, -o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 left_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(sx + o, sy, sz + o),
+                                Vec3::new(sx + o, 0.0, sz + o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 right_rot,
                                 RoofFaceSelector::Slope,
@@ -750,14 +750,14 @@ impl Interpreter {
                             vec![
                                 // Two slope panels
                                 (
-                                    Vec3::new(sx + o, sy, -o),
+                                    Vec3::new(sx + o, 0.0, -o),
                                     Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                     front_rot,
                                     RoofFaceSelector::Slope,
                                     0.0,
                                 ),
                                 (
-                                    Vec3::new(-o, sy, sz + o),
+                                    Vec3::new(-o, 0.0, sz + o),
                                     Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                     back_rot,
                                     RoofFaceSelector::Slope,
@@ -765,14 +765,14 @@ impl Interpreter {
                                 ),
                                 // Two vertical gable-end rectangles (same orientation as Left/Right Comp faces)
                                 (
-                                    Vec3::new(0.0, sy, 0.0),
+                                    Vec3::new(0.0, 0.0, 0.0),
                                     Vec3::new(sz, h, 0.0),
                                     Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
                                     RoofFaceSelector::GableEnd,
                                     0.0,
                                 ),
                                 (
-                                    Vec3::new(sx, sy, sz),
+                                    Vec3::new(sx, 0.0, sz),
                                     Vec3::new(sz, h, 0.0),
                                     Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
                                     RoofFaceSelector::GableEnd,
@@ -782,28 +782,28 @@ impl Interpreter {
                         }
                         RoofType::Hip => vec![
                             (
-                                Vec3::new(sx + o, sy, -o),
+                                Vec3::new(sx + o, 0.0, -o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 front_rot,
                                 RoofFaceSelector::Slope,
                                 0.0,
                             ),
                             (
-                                Vec3::new(-o, sy, sz + o),
+                                Vec3::new(-o, 0.0, sz + o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 back_rot,
                                 RoofFaceSelector::Slope,
                                 0.0,
                             ),
                             (
-                                Vec3::new(-o, sy, -o),
+                                Vec3::new(-o, 0.0, -o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 left_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(sx + o, sy, sz + o),
+                                Vec3::new(sx + o, 0.0, sz + o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 right_rot,
                                 RoofFaceSelector::Slope,
@@ -1661,8 +1661,8 @@ mod tests {
         let model = interp.derive(scope, "R").unwrap();
         assert_eq!(model.len(), 1);
         assert_eq!(model.terminals[0].mesh_id, "Tiles");
-        // Panel positioned at top of building
-        assert!((model.terminals[0].scope.position.y - 5.0).abs() < 1e-6);
+        // Panel positioned at the base of the roof scope (local Y = 0.0)
+        assert!((model.terminals[0].scope.position.y - 0.0).abs() < 1e-6);
     }
 
     #[test]
