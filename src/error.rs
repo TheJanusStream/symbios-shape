@@ -22,4 +22,10 @@ pub enum ShapeError {
     DepthLimitExceeded(usize),
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error("Offset inset distance exceeds scope dimension")]
+    OffsetTooLarge,
+    #[error("Roof angle must be in (0°, 90°): got {0}")]
+    InvalidRoofAngle(f64),
+    #[error("Align target vector must be non-zero")]
+    InvalidAlignTarget,
 }

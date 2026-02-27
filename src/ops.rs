@@ -87,6 +87,89 @@ pub enum CompTarget {
     Faces(Vec<CompFaceCase>),
 }
 
+/// Face selectors for the `Offset` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OffsetSelector {
+    /// The inset/outset region (the area inside the border).
+    Inside,
+    /// The surrounding border strips.
+    Border,
+    /// Matches any selector not otherwise mapped.
+    All,
+}
+
+impl OffsetSelector {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "inside" | "Inside" => Some(Self::Inside),
+            "border" | "Border" => Some(Self::Border),
+            "all" | "All" | "_" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// A single mapping in an `Offset` block: a selector → rule name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OffsetCase {
+    pub selector: OffsetSelector,
+    pub rule: String,
+}
+
+/// Roof shape types for the `Roof` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoofType {
+    /// Four triangular slope panels meeting at a single apex.
+    Pyramid,
+    /// Single slope panel from front eave to back eave.
+    Shed,
+    /// Two slope panels meeting at a horizontal ridge; two triangular gable ends.
+    Gable,
+    /// Four trapezoidal slope panels meeting at a horizontal ridge.
+    Hip,
+}
+
+impl RoofType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pyramid" | "Pyramid" => Some(Self::Pyramid),
+            "shed" | "Shed" => Some(Self::Shed),
+            "gable" | "Gable" => Some(Self::Gable),
+            "hip" | "Hip" => Some(Self::Hip),
+            _ => None,
+        }
+    }
+}
+
+/// Face selectors for the `Roof` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RoofFaceSelector {
+    /// The sloped panel(s).
+    Slope,
+    /// The triangular vertical end panels of a Gable roof.
+    GableEnd,
+    /// Matches any selector not otherwise mapped.
+    All,
+}
+
+impl RoofFaceSelector {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "slope" | "Slope" => Some(Self::Slope),
+            "gable" | "GableEnd" | "gableEnd" => Some(Self::GableEnd),
+            "all" | "All" | "_" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// A single mapping in a `Roof` block: a face selector → rule name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoofCase {
+    pub selector: RoofFaceSelector,
+    pub rule: String,
+}
+
 /// The atomic CGA operations that the interpreter executes.
 ///
 /// Every operation transforms the current `Scope` into zero or more child scopes,
@@ -137,4 +220,40 @@ pub enum ShapeOp {
     /// Calls a named sub-rule on the current scope unchanged.
     /// Used for grammar rule references that don't transform the scope themselves.
     Rule(String),
+
+    /// Rotates the scope so that the specified local axis points in the given world direction.
+    ///
+    /// Applies the shortest-arc rotation from the current world direction of `local_axis`
+    /// to `target`. Useful for recovering from accumulated rotations.
+    /// Syntax: `Align(Y, Up)`, `Align(Z, Forward)`, etc.
+    /// Named targets: `Up`=(0,1,0), `Down`=(0,-1,0), `Right`=(1,0,0), `Left`=(-1,0,0),
+    /// `Forward`=(0,0,-1), `Back`=(0,0,1).
+    Align { local_axis: Axis, target: Vec3 },
+
+    /// Creates an inset (`distance < 0`) frame on a 2D face scope.
+    ///
+    /// Produces up to two kinds of child scopes:
+    /// - `Inside`: the inset rectangle.
+    /// - `Border`: four surrounding strips (bottom, top, left, right), each invoking the same rule.
+    ///
+    /// Syntax: `Offset(-0.2) { Inside: Glass | Border: Frame }`
+    Offset {
+        distance: f64,
+        cases: Vec<OffsetCase>,
+    },
+
+    /// Generates a roof structure above the current scope.
+    ///
+    /// Operates on a volume scope; the `angle` is the pitch measured in degrees from
+    /// horizontal. `overhang` is the extra distance the roof extends beyond the scope
+    /// footprint on each side.
+    ///
+    /// Syntax: `Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }`
+    /// Syntax: `Roof(Hip, 30, 0.5) { Slope: Tiles }`
+    Roof {
+        roof_type: RoofType,
+        angle: f64,
+        overhang: f64,
+        cases: Vec<RoofCase>,
+    },
 }

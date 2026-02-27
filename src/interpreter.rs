@@ -14,7 +14,10 @@ use rand_pcg::Pcg64;
 
 use crate::error::ShapeError;
 use crate::model::{ShapeModel, Terminal};
-use crate::ops::{Axis, CompTarget, FaceSelector, ShapeOp, SplitSize, SplitSlot};
+use crate::ops::{
+    Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase, RoofFaceSelector,
+    RoofType, ShapeOp, SplitSize, SplitSlot,
+};
 use crate::scope::{Quat, Scope, Vec3};
 
 /// Safety caps (DoS protection).
@@ -147,70 +150,73 @@ fn slice_scope(parent: &Scope, axis: Axis, offset: f64, size: f64) -> Scope {
 
 /// All six canonical faces of an OBB, each with a proper outward-facing orientation.
 ///
-/// **Convention:** Local **Y** points along the outward normal.
+/// **Convention:** Local **Z** points along the outward normal.  Local **X** is
+/// world-horizontal along the face; Local **Y** is world-up for vertical faces.
 ///
-/// This allows `Extrude(h)` (which modifies Y) to always extrude "outward" from
-/// the face, creating valid 3D volumes from 2D faces.
+/// This means `Split(X)` tiles a wall horizontally and `Split(Y)` divides it
+/// into floors — the same grammar rule works on any vertical face without manual
+/// rotation hacks.
 ///
 /// Each entry: `(selector, local_offset, face_size, rotation_delta)`.
-/// `face_size` uses Y=0 (flattened). The dimensions are mapped to X and Z.
+/// `face_size` uses Z=0 (flattened 2-D canvas).
 fn face_descs(scope_size: Vec3) -> [(FaceSelector, Vec3, Vec3, Quat); 6] {
     let sx = scope_size.x;
     let sy = scope_size.y;
     let sz = scope_size.z;
 
     [
-        // Bottom: normal = -Y
-        // Rotate 180° around Z: Y -> -Y, X -> -X.
-        // Origin starts at (sx, 0, 0) to compensate for X reversal.
+        // Bottom: outward = -Y.  Local X=+X, Local Y=+Z, Local Z=-Y.
+        // Rotation: from_axis_angle(X, +π/2) → X→X, Y→+Z, Z→-Y.
         (
             FaceSelector::Bottom,
-            Vec3::new(sx, 0.0, 0.0),
-            Vec3::new(sx, 0.0, sz),
-            Quat::from_axis_angle(Vec3::Z, PI),
-        ),
-        // Top: normal = +Y
-        // Identity: Y is already Up.
-        (
-            FaceSelector::Top,
-            Vec3::new(0.0, sy, 0.0),
-            Vec3::new(sx, 0.0, sz),
-            Quat::IDENTITY,
-        ),
-        // Front: normal = -Z
-        // Rotate -90° around X: Y -> -Z, Z -> Y.
-        (
-            FaceSelector::Front,
             Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(sx, 0.0, sy),
-            Quat::from_axis_angle(Vec3::X, -FRAC_PI_2),
-        ),
-        // Back: normal = +Z
-        // Rotate +90° around X: Y -> Z, Z -> -Y.
-        // Origin shift to (0, sy, sz) to align 0..sy with Z..0.
-        (
-            FaceSelector::Back,
-            Vec3::new(0.0, sy, sz),
-            Vec3::new(sx, 0.0, sy),
+            Vec3::new(sx, sz, 0.0),
             Quat::from_axis_angle(Vec3::X, FRAC_PI_2),
         ),
-        // Left: normal = -X
-        // Rotate +90° around Z: Y -> -X, X -> Y.
-        // Origin shift to (0, 0, 0).
+        // Top: outward = +Y.  Local X=+X, Local Y=-Z, Local Z=+Y.
+        // Rotation: from_axis_angle(X, -π/2) → X→X, Y→-Z, Z→+Y.
+        // Origin at (0, sy, sz) so local-Y tiles from back to front.
+        (
+            FaceSelector::Top,
+            Vec3::new(0.0, sy, sz),
+            Vec3::new(sx, sz, 0.0),
+            Quat::from_axis_angle(Vec3::X, -FRAC_PI_2),
+        ),
+        // Front: outward = -Z.  Local X=-X, Local Y=+Y, Local Z=-Z.
+        // Rotation: from_axis_angle(Y, π) → X→-X, Y→Y, Z→-Z.
+        // Origin at (sx, 0, 0) so local-X tiles from right to left in world.
+        (
+            FaceSelector::Front,
+            Vec3::new(sx, 0.0, 0.0),
+            Vec3::new(sx, sy, 0.0),
+            Quat::from_axis_angle(Vec3::Y, PI),
+        ),
+        // Back: outward = +Z.  Local X=+X, Local Y=+Y, Local Z=+Z.
+        // Rotation: identity.
+        // Origin at (0, 0, sz).
+        (
+            FaceSelector::Back,
+            Vec3::new(0.0, 0.0, sz),
+            Vec3::new(sx, sy, 0.0),
+            Quat::IDENTITY,
+        ),
+        // Left: outward = -X.  Local X=+Z, Local Y=+Y, Local Z=-X.
+        // Rotation: from_axis_angle(Y, -π/2) → X→+Z, Y→Y, Z→-X.
+        // Origin at (0, 0, 0).
         (
             FaceSelector::Left,
             Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(sy, 0.0, sz),
-            Quat::from_axis_angle(Vec3::Z, FRAC_PI_2),
+            Vec3::new(sz, sy, 0.0),
+            Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
         ),
-        // Right: normal = +X
-        // Rotate -90° around Z: Y -> X, X -> -Y.
-        // Origin shift to (sx, sy, 0).
+        // Right: outward = +X.  Local X=-Z, Local Y=+Y, Local Z=+X.
+        // Rotation: from_axis_angle(Y, +π/2) → X→-Z, Y→Y, Z→+X.
+        // Origin at (sx, 0, sz).
         (
             FaceSelector::Right,
-            Vec3::new(sx, sy, 0.0),
-            Vec3::new(sy, 0.0, sz),
-            Quat::from_axis_angle(Vec3::Z, -FRAC_PI_2),
+            Vec3::new(sx, 0.0, sz),
+            Vec3::new(sz, sy, 0.0),
+            Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
         ),
     ]
 }
@@ -239,6 +245,66 @@ fn find_face_rule(selector: FaceSelector, cases: &[crate::ops::CompFaceCase]) ->
         }
     }
     None
+}
+
+/// Returns the local-space unit vector for the given axis.
+fn axis_vec(axis: Axis) -> Vec3 {
+    match axis {
+        Axis::X => Vec3::X,
+        Axis::Y => Vec3::Y,
+        Axis::Z => Vec3::Z,
+    }
+}
+
+/// Rule look-up for `Offset` cases.
+fn find_offset_rule(selector: OffsetSelector, cases: &[OffsetCase]) -> Option<&str> {
+    for c in cases {
+        if c.selector == selector {
+            return Some(&c.rule);
+        }
+    }
+    for c in cases {
+        if c.selector == OffsetSelector::All {
+            return Some(&c.rule);
+        }
+    }
+    None
+}
+
+/// Rule look-up for `Roof` cases.
+fn find_roof_rule(selector: RoofFaceSelector, cases: &[RoofCase]) -> Option<&str> {
+    for c in cases {
+        if c.selector == selector {
+            return Some(&c.rule);
+        }
+    }
+    for c in cases {
+        if c.selector == RoofFaceSelector::All {
+            return Some(&c.rule);
+        }
+    }
+    None
+}
+
+/// Rotations for the four cardinal slope directions used by `Roof`.
+///
+/// All rotations are expressed as deltas in the **parent scope's local frame**
+/// (composed as `scope.rotation * delta` to obtain the world-space rotation).
+///
+/// Convention: Local X = across the ridge (world-horizontal), Local Y = up the slope.
+///
+/// - `front_rot`: slope rises toward +Z  (from front eave at z=0 up to ridge at z=sz/2)
+/// - `back_rot`:  slope rises toward -Z  (from back  eave at z=sz up to ridge at z=sz/2)
+/// - `left_rot`:  slope rises toward +X  (from left  eave at x=0 up to ridge at x=sx/2)
+/// - `right_rot`: slope rises toward -X  (from right eave at x=sx up to ridge at x=sx/2)
+fn roof_slope_rotations(alpha: f64) -> (Quat, Quat, Quat, Quat) {
+    let front_rot = Quat::from_axis_angle(Vec3::X, FRAC_PI_2 - alpha);
+    let back_rot = Quat::from_axis_angle(Vec3::X, alpha - FRAC_PI_2);
+    // Left/right: rotate Local X to +Z, then tilt Local Y up the slope.
+    let tilt_y = Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2);
+    let left_rot = Quat::from_axis_angle(Vec3::Z, alpha - FRAC_PI_2) * tilt_y;
+    let right_rot = Quat::from_axis_angle(Vec3::Z, FRAC_PI_2 - alpha) * tilt_y;
+    (front_rot, back_rot, left_rot, right_rot)
 }
 
 // ── Stochastic selection ──────────────────────────────────────────────────────
@@ -469,6 +535,246 @@ impl Interpreter {
 
                 ShapeOp::Mat(mat_id) => {
                     material = Some(mat_id.clone());
+                }
+
+                // ── Transform: Align ─────────────────────────────────────
+                ShapeOp::Align { local_axis, target } => {
+                    if !target.is_finite() || target.length_squared() < 1e-12 {
+                        return Err(ShapeError::InvalidAlignTarget);
+                    }
+                    let target_norm = target.normalize();
+                    let current = scope.rotation * axis_vec(*local_axis);
+                    // from_rotation_arc gives the shortest-arc rotation; it degenerates
+                    // when vectors are antiparallel — handle that with a fallback 180°.
+                    let dot = current.dot(target_norm);
+                    let q = if (dot + 1.0).abs() < 1e-9 {
+                        let perp = if current.x.abs() < 0.9 {
+                            current.cross(Vec3::X).normalize()
+                        } else {
+                            current.cross(Vec3::Y).normalize()
+                        };
+                        Quat::from_axis_angle(perp, PI)
+                    } else {
+                        Quat::from_rotation_arc(current, target_norm)
+                    };
+                    scope.rotation = (q * scope.rotation).normalize();
+                }
+
+                // ── Branching: Offset ─────────────────────────────────────
+                ShapeOp::Offset { distance, cases } => {
+                    if !distance.is_finite() {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
+                    // Negative distance = inset.
+                    let inset = -*distance;
+                    if inset <= 0.0 {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
+                    let sx = scope.size.x;
+                    let sy = scope.size.y;
+                    let inside_w = sx - 2.0 * inset;
+                    let inside_h = sy - 2.0 * inset;
+                    if inside_w < 0.0 || inside_h < 0.0 {
+                        return Err(ShapeError::OffsetTooLarge);
+                    }
+                    if let Some(rule) = find_offset_rule(OffsetSelector::Inside, cases) {
+                        if queue.len() >= MAX_QUEUE {
+                            return Err(ShapeError::CapacityOverflow);
+                        }
+                        let pos = scope.position + scope.rotation * Vec3::new(inset, inset, 0.0);
+                        queue.push_back(WorkItem {
+                            scope: Scope::new(
+                                pos,
+                                scope.rotation,
+                                Vec3::new(inside_w, inside_h, 0.0),
+                            ),
+                            rule: rule.to_string(),
+                            depth: depth + 1,
+                            taper: 0.0,
+                            material: material.clone(),
+                        });
+                    }
+                    if let Some(rule) = find_offset_rule(OffsetSelector::Border, cases) {
+                        // 4 surrounding strips: bottom, top, left, right.
+                        let strips = [
+                            (Vec3::new(0.0, 0.0, 0.0), Vec3::new(sx, inset, 0.0)),
+                            (Vec3::new(0.0, sy - inset, 0.0), Vec3::new(sx, inset, 0.0)),
+                            (
+                                Vec3::new(0.0, inset, 0.0),
+                                Vec3::new(inset, sy - 2.0 * inset, 0.0),
+                            ),
+                            (
+                                Vec3::new(sx - inset, inset, 0.0),
+                                Vec3::new(inset, sy - 2.0 * inset, 0.0),
+                            ),
+                        ];
+                        if queue.len() + strips.len() > MAX_QUEUE {
+                            return Err(ShapeError::CapacityOverflow);
+                        }
+                        for (local_off, strip_size) in strips {
+                            let pos = scope.position + scope.rotation * local_off;
+                            queue.push_back(WorkItem {
+                                scope: Scope::new(pos, scope.rotation, strip_size),
+                                rule: rule.to_string(),
+                                depth: depth + 1,
+                                taper: 0.0,
+                                material: material.clone(),
+                            });
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // ── Branching: Roof ───────────────────────────────────────
+                ShapeOp::Roof {
+                    roof_type,
+                    angle,
+                    overhang,
+                    cases,
+                } => {
+                    if !angle.is_finite() || *angle <= 0.0 || *angle >= 90.0 {
+                        return Err(ShapeError::InvalidRoofAngle(*angle));
+                    }
+                    if !overhang.is_finite() || *overhang < 0.0 {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
+                    let sx = scope.size.x;
+                    let sy = scope.size.y;
+                    let sz = scope.size.z;
+                    let o = *overhang;
+                    let alpha = angle.to_radians();
+                    let cos_a = alpha.cos();
+                    let (front_rot, back_rot, left_rot, right_rot) = roof_slope_rotations(alpha);
+
+                    // slope_lengths: (fb = front/back depth, lr = left/right depth)
+                    let fb_len = (sz / 2.0 + o) / cos_a;
+                    let lr_len = (sx / 2.0 + o) / cos_a;
+
+                    // Each panel: (local_offset, face_size, rot_delta, selector, taper)
+                    type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, f64);
+                    let panels: Vec<Panel> = match roof_type {
+                        RoofType::Shed => vec![(
+                            Vec3::new(-o, sy, -o),
+                            Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
+                            front_rot,
+                            RoofFaceSelector::Slope,
+                            0.0,
+                        )],
+                        RoofType::Pyramid => vec![
+                            (
+                                Vec3::new(-o, sy, -o),
+                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                                front_rot,
+                                RoofFaceSelector::Slope,
+                                1.0,
+                            ),
+                            (
+                                Vec3::new(-o, sy, sz + o),
+                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                                back_rot,
+                                RoofFaceSelector::Slope,
+                                1.0,
+                            ),
+                            (
+                                Vec3::new(-o, sy, -o),
+                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
+                                left_rot,
+                                RoofFaceSelector::Slope,
+                                1.0,
+                            ),
+                            (
+                                Vec3::new(sx + o, sy, -o),
+                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
+                                right_rot,
+                                RoofFaceSelector::Slope,
+                                1.0,
+                            ),
+                        ],
+                        RoofType::Gable => {
+                            let h = (sz / 2.0) * alpha.tan();
+                            vec![
+                                // Two slope panels
+                                (
+                                    Vec3::new(-o, sy, -o),
+                                    Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                                    front_rot,
+                                    RoofFaceSelector::Slope,
+                                    0.0,
+                                ),
+                                (
+                                    Vec3::new(-o, sy, sz + o),
+                                    Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                                    back_rot,
+                                    RoofFaceSelector::Slope,
+                                    0.0,
+                                ),
+                                // Two vertical gable-end rectangles (same orientation as Left/Right Comp faces)
+                                (
+                                    Vec3::new(0.0, sy, 0.0),
+                                    Vec3::new(sz, h, 0.0),
+                                    Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
+                                    RoofFaceSelector::GableEnd,
+                                    0.0,
+                                ),
+                                (
+                                    Vec3::new(sx, sy, sz),
+                                    Vec3::new(sz, h, 0.0),
+                                    Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
+                                    RoofFaceSelector::GableEnd,
+                                    0.0,
+                                ),
+                            ]
+                        }
+                        RoofType::Hip => vec![
+                            (
+                                Vec3::new(-o, sy, -o),
+                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                                front_rot,
+                                RoofFaceSelector::Slope,
+                                0.0,
+                            ),
+                            (
+                                Vec3::new(-o, sy, sz + o),
+                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                                back_rot,
+                                RoofFaceSelector::Slope,
+                                0.0,
+                            ),
+                            (
+                                Vec3::new(-o, sy, -o),
+                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
+                                left_rot,
+                                RoofFaceSelector::Slope,
+                                1.0,
+                            ),
+                            (
+                                Vec3::new(sx + o, sy, -o),
+                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
+                                right_rot,
+                                RoofFaceSelector::Slope,
+                                1.0,
+                            ),
+                        ],
+                    };
+
+                    if queue.len() + panels.len() > MAX_QUEUE {
+                        return Err(ShapeError::CapacityOverflow);
+                    }
+                    for (local_off, face_size, rot_delta, selector, panel_taper) in panels {
+                        let Some(rule) = find_roof_rule(selector, cases) else {
+                            continue;
+                        };
+                        let face_pos = scope.position + scope.rotation * local_off;
+                        let face_rot = (scope.rotation * rot_delta).normalize();
+                        queue.push_back(WorkItem {
+                            scope: Scope::new(face_pos, face_rot, face_size),
+                            rule: rule.to_string(),
+                            depth: depth + 1,
+                            taper: panel_taper,
+                            material: material.clone(),
+                        });
+                    }
+                    return Ok(());
                 }
 
                 // ── Branching: Split ──────────────────────────────────────
@@ -1117,6 +1423,280 @@ mod tests {
         assert!(matches!(
             interp.add_weighted_rules("R", vec![(-1.0, vec![ShapeOp::I("M".to_string())])]),
             Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    // ── Feature: Align ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_align_y_to_world_up_when_rotated() {
+        // Rotate 90° around Z (Y → -X), then Align(Y, Up) should restore Y = +Y.
+        let mut interp = Interpreter::new();
+        let ninety_z = Quat::from_axis_angle(Vec3::Z, std::f64::consts::FRAC_PI_2);
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Rotate(ninety_z),
+                ShapeOp::Align {
+                    local_axis: Axis::Y,
+                    target: Vec3::Y,
+                },
+                ShapeOp::I("M".to_string()),
+            ],
+        );
+        let model = interp.derive(Scope::unit(), "R").unwrap();
+        assert_eq!(model.len(), 1);
+        let world_y = model.terminals[0].scope.rotation * Vec3::Y;
+        assert!(
+            (world_y - Vec3::Y).length() < 1e-6,
+            "expected Y=(0,1,0), got {:?}",
+            world_y
+        );
+    }
+
+    #[test]
+    fn test_align_already_aligned_is_noop() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Align {
+                    local_axis: Axis::Y,
+                    target: Vec3::Y,
+                },
+                ShapeOp::I("M".to_string()),
+            ],
+        );
+        let model = interp.derive(Scope::unit(), "R").unwrap();
+        let rot = model.terminals[0].scope.rotation;
+        assert!((rot.length_squared() - 1.0).abs() < 1e-9);
+        // Rotation should still be unit (identity-like for already-aligned)
+        let world_y = rot * Vec3::Y;
+        assert!((world_y - Vec3::Y).length() < 1e-6);
+    }
+
+    #[test]
+    fn test_align_zero_target_rejected() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Align {
+                    local_axis: Axis::Y,
+                    target: Vec3::ZERO,
+                },
+                ShapeOp::I("M".to_string()),
+            ],
+        );
+        assert!(matches!(
+            interp.derive(Scope::unit(), "R"),
+            Err(ShapeError::InvalidAlignTarget)
+        ));
+    }
+
+    // ── Feature: Offset ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_offset_inset_produces_inside_and_border() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Offset {
+                distance: -0.5,
+                cases: vec![
+                    crate::ops::OffsetCase {
+                        selector: crate::ops::OffsetSelector::Inside,
+                        rule: "Glass".to_string(),
+                    },
+                    crate::ops::OffsetCase {
+                        selector: crate::ops::OffsetSelector::Border,
+                        rule: "Frame".to_string(),
+                    },
+                ],
+            }],
+        );
+        // 4×3 face scope (z=0)
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(4.0, 3.0, 0.0));
+        let model = interp.derive(scope, "R").unwrap();
+        // 1 Inside + 4 Border strips = 5 terminals
+        assert_eq!(model.len(), 5);
+        // Inside scope: size = (3.0, 2.0, 0.0), positioned at (0.5, 0.5, 0.0)
+        let inside = model
+            .terminals
+            .iter()
+            .find(|t| t.mesh_id == "Glass")
+            .unwrap();
+        assert!((inside.scope.size.x - 3.0).abs() < 1e-9);
+        assert!((inside.scope.size.y - 2.0).abs() < 1e-9);
+        assert!((inside.scope.position - Vec3::new(0.5, 0.5, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn test_offset_too_large_rejected() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Offset {
+                distance: -2.0, // 2*2.0 = 4 > 3 (sy)
+                cases: vec![crate::ops::OffsetCase {
+                    selector: crate::ops::OffsetSelector::Inside,
+                    rule: "A".to_string(),
+                }],
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(4.0, 3.0, 0.0));
+        assert!(matches!(
+            interp.derive(scope, "R"),
+            Err(ShapeError::OffsetTooLarge)
+        ));
+    }
+
+    #[test]
+    fn test_offset_positive_distance_rejected() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Offset {
+                distance: 0.2,
+                cases: vec![crate::ops::OffsetCase {
+                    selector: crate::ops::OffsetSelector::Inside,
+                    rule: "A".to_string(),
+                }],
+            }],
+        );
+        assert!(matches!(
+            interp.derive(Scope::unit(), "R"),
+            Err(ShapeError::InvalidNumericValue)
+        ));
+    }
+
+    // ── Feature: Roof ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_roof_shed_produces_one_slope() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Roof {
+                roof_type: RoofType::Shed,
+                angle: 30.0,
+                overhang: 0.0,
+                cases: vec![crate::ops::RoofCase {
+                    selector: RoofFaceSelector::Slope,
+                    rule: "Tiles".to_string(),
+                }],
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 5.0, 8.0));
+        let model = interp.derive(scope, "R").unwrap();
+        assert_eq!(model.len(), 1);
+        assert_eq!(model.terminals[0].mesh_id, "Tiles");
+        // Panel positioned at top of building
+        assert!((model.terminals[0].scope.position.y - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_roof_gable_produces_four_panels() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Roof {
+                roof_type: RoofType::Gable,
+                angle: 30.0,
+                overhang: 0.0,
+                cases: vec![
+                    crate::ops::RoofCase {
+                        selector: RoofFaceSelector::Slope,
+                        rule: "Tiles".to_string(),
+                    },
+                    crate::ops::RoofCase {
+                        selector: RoofFaceSelector::GableEnd,
+                        rule: "Bricks".to_string(),
+                    },
+                ],
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 5.0, 8.0));
+        let model = interp.derive(scope, "R").unwrap();
+        // 2 slope + 2 gable-end panels
+        assert_eq!(model.len(), 4);
+        let tiles: Vec<_> = model
+            .terminals
+            .iter()
+            .filter(|t| t.mesh_id == "Tiles")
+            .collect();
+        let bricks: Vec<_> = model
+            .terminals
+            .iter()
+            .filter(|t| t.mesh_id == "Bricks")
+            .collect();
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(bricks.len(), 2);
+    }
+
+    #[test]
+    fn test_roof_hip_produces_four_slopes() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Roof {
+                roof_type: RoofType::Hip,
+                angle: 45.0,
+                overhang: 0.3,
+                cases: vec![crate::ops::RoofCase {
+                    selector: RoofFaceSelector::Slope,
+                    rule: "Tiles".to_string(),
+                }],
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 4.0, 8.0));
+        let model = interp.derive(scope, "R").unwrap();
+        assert_eq!(model.len(), 4);
+    }
+
+    #[test]
+    fn test_roof_pyramid_produces_four_tapered_slopes() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Roof {
+                roof_type: RoofType::Pyramid,
+                angle: 40.0,
+                overhang: 0.0,
+                cases: vec![crate::ops::RoofCase {
+                    selector: RoofFaceSelector::Slope,
+                    rule: "Tiles".to_string(),
+                }],
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(6.0, 3.0, 6.0));
+        let model = interp.derive(scope, "R").unwrap();
+        assert_eq!(model.len(), 4);
+        // All pyramid panels carry taper=1.0
+        for t in &model.terminals {
+            assert!(
+                (t.taper - 1.0).abs() < 1e-9,
+                "expected taper=1.0, got {}",
+                t.taper
+            );
+        }
+    }
+
+    #[test]
+    fn test_roof_invalid_angle_rejected() {
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Roof {
+                roof_type: RoofType::Shed,
+                angle: 0.0,
+                overhang: 0.0,
+                cases: vec![],
+            }],
+        );
+        assert!(matches!(
+            interp.derive(Scope::unit(), "R"),
+            Err(ShapeError::InvalidRoofAngle(_))
         ));
     }
 }

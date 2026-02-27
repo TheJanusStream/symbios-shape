@@ -47,5 +47,8 @@ pub mod scope;
 pub use error::ShapeError;
 pub use interpreter::Interpreter;
 pub use model::{ShapeModel, Terminal};
-pub use ops::{Axis, CompTarget, FaceSelector, ShapeOp, SplitSize, SplitSlot};
+pub use ops::{
+    Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase, RoofFaceSelector,
+    RoofType, ShapeOp, SplitSize, SplitSlot,
+};
 pub use scope::{Quat, Scope, Vec3};

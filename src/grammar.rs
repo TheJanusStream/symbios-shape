@@ -19,7 +19,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, take_until, take_while, take_while_m_n, take_while1},
     character::complete::{char as c_char, multispace1},
-    combinator::{cut, map, verify},
+    combinator::{cut, map, opt, verify},
     error::{Error, ErrorKind},
     multi::many0,
     number::complete::double,
@@ -27,7 +27,10 @@ use nom::{
 };
 
 use crate::error::ShapeError;
-use crate::ops::{Axis, CompFaceCase, CompTarget, FaceSelector, ShapeOp, SplitSize, SplitSlot};
+use crate::ops::{
+    Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase,
+    RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
+};
 use crate::scope::{Quat, Vec3};
 
 // Safety limits (DoS protection)
@@ -356,6 +359,147 @@ fn parse_mat(input: &str) -> IResult<&str, ShapeOp> {
     Ok((input, ShapeOp::Mat(mat_id)))
 }
 
+/// Parses a named world-direction shorthand: `Up`, `Down`, `Right`, `Left`,
+/// `Forward`, `Back` (also accepted with a `World.` prefix).
+fn parse_align_target(input: &str) -> IResult<&str, Vec3> {
+    let (input, _) = opt(terminated(tag("World"), c_char('.'))).parse(input)?;
+    let (input, name) = identifier.parse(input)?;
+    let v = match name {
+        "Up" => Vec3::new(0.0, 1.0, 0.0),
+        "Down" => Vec3::new(0.0, -1.0, 0.0),
+        "Right" => Vec3::new(1.0, 0.0, 0.0),
+        "Left" => Vec3::new(-1.0, 0.0, 0.0),
+        "Forward" => Vec3::new(0.0, 0.0, -1.0),
+        "Back" => Vec3::new(0.0, 0.0, 1.0),
+        _ => return Err(nom::Err::Failure(Error::new(input, ErrorKind::Tag))),
+    };
+    Ok((input, v))
+}
+
+/// `Align(Y, Up)` or `Align(Z, World.Forward)`
+fn parse_align(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("Align").parse(input)?;
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, local_axis) = cut(ws(parse_axis)).parse(input)?;
+    let (input, _) = cut(ws(c_char(','))).parse(input)?;
+    let (input, target) = cut(ws(parse_align_target)).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    Ok((input, ShapeOp::Align { local_axis, target }))
+}
+
+fn parse_offset_case(input: &str) -> IResult<&str, OffsetCase> {
+    let (input, sel_str) = ws(identifier).parse(input)?;
+    let selector = OffsetSelector::parse(sel_str)
+        .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Tag)))?;
+    let (input, _) = ws(c_char(':')).parse(input)?;
+    let (input, rule) = ws(rule_name).parse(input)?;
+    Ok((input, OffsetCase { selector, rule }))
+}
+
+/// `Offset(-0.2) { Inside: Glass | Border: Frame }`
+fn parse_offset(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("Offset").parse(input)?;
+    let (input, distance) = cut(delimited(
+        ws(c_char('(')),
+        ws(finite_float),
+        ws(c_char(')')),
+    ))
+    .parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
+    let (mut remaining, first) = cut(ws(parse_offset_case)).parse(input)?;
+    let mut cases = vec![first];
+    loop {
+        if cases.len() >= MAX_COMP_CASES {
+            return Err(nom::Err::Failure(Error::new(
+                remaining,
+                ErrorKind::TooLarge,
+            )));
+        }
+        let Ok((after_sep, _)) = ws::<_, _, Error<&str>>(c_char('|')).parse(remaining) else {
+            break;
+        };
+        match ws(parse_offset_case).parse(after_sep) {
+            Ok((after_item, case)) => {
+                cases.push(case);
+                remaining = after_item;
+            }
+            Err(nom::Err::Failure(e)) => return Err(nom::Err::Failure(e)),
+            Err(_) => {
+                remaining = after_sep;
+                break;
+            }
+        }
+    }
+    let (remaining, _) = ws(c_char('}')).parse(remaining)?;
+    Ok((remaining, ShapeOp::Offset { distance, cases }))
+}
+
+fn parse_roof_case(input: &str) -> IResult<&str, RoofCase> {
+    let (input, sel_str) = ws(identifier).parse(input)?;
+    let selector = RoofFaceSelector::parse(sel_str)
+        .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Tag)))?;
+    let (input, _) = ws(c_char(':')).parse(input)?;
+    let (input, rule) = ws(rule_name).parse(input)?;
+    Ok((input, RoofCase { selector, rule }))
+}
+
+/// `Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }`
+/// `Roof(Hip, 30, 0.5) { Slope: Tiles }`
+fn parse_roof(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("Roof").parse(input)?;
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, type_str) = cut(ws(identifier)).parse(input)?;
+    let roof_type = RoofType::parse(type_str)
+        .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Tag)))?;
+    let (input, _) = cut(ws(c_char(','))).parse(input)?;
+    let (input, angle) = cut(ws(finite_float)).parse(input)?;
+    if angle <= 0.0 || angle >= 90.0 {
+        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+    }
+    // Optional overhang argument.
+    let (input, overhang) = opt(preceded(ws(c_char(',')), ws(finite_float))).parse(input)?;
+    let overhang = overhang.unwrap_or(0.0);
+    if overhang < 0.0 {
+        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+    }
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
+    let (mut remaining, first) = cut(ws(parse_roof_case)).parse(input)?;
+    let mut cases = vec![first];
+    loop {
+        if cases.len() >= MAX_COMP_CASES {
+            return Err(nom::Err::Failure(Error::new(
+                remaining,
+                ErrorKind::TooLarge,
+            )));
+        }
+        let Ok((after_sep, _)) = ws::<_, _, Error<&str>>(c_char('|')).parse(remaining) else {
+            break;
+        };
+        match ws(parse_roof_case).parse(after_sep) {
+            Ok((after_item, case)) => {
+                cases.push(case);
+                remaining = after_item;
+            }
+            Err(nom::Err::Failure(e)) => return Err(nom::Err::Failure(e)),
+            Err(_) => {
+                remaining = after_sep;
+                break;
+            }
+        }
+    }
+    let (remaining, _) = ws(c_char('}')).parse(remaining)?;
+    Ok((
+        remaining,
+        ShapeOp::Roof {
+            roof_type,
+            angle,
+            overhang,
+            cases,
+        },
+    ))
+}
+
 fn parse_rule_ref(input: &str) -> IResult<&str, ShapeOp> {
     map(ws(rule_name), ShapeOp::Rule).parse(input)
 }
@@ -375,6 +519,9 @@ fn parse_op(input: &str) -> IResult<&str, ShapeOp> {
         parse_comp,
         parse_instance,
         parse_mat,
+        parse_align,
+        parse_offset,
+        parse_roof,
         parse_rule_ref,
     ))
     .parse(input)
@@ -383,7 +530,7 @@ fn parse_op(input: &str) -> IResult<&str, ShapeOp> {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Returns true if `op` ends execution of a rule body — either by branching
-/// (Split / Comp / Repeat) or by producing a terminal (I / Rule).
+/// (Split / Comp / Repeat / Offset / Roof) or by producing a terminal (I / Rule).
 /// Any operations listed after such an op in the source are unreachable.
 fn is_terminating_op(op: &ShapeOp) -> bool {
     matches!(
@@ -393,6 +540,8 @@ fn is_terminating_op(op: &ShapeOp) -> bool {
             | ShapeOp::Split { .. }
             | ShapeOp::Comp(_)
             | ShapeOp::Repeat { .. }
+            | ShapeOp::Offset { .. }
+            | ShapeOp::Roof { .. }
     )
 }
 
@@ -880,5 +1029,106 @@ mod tests {
     fn test_scale_positive_accepted() {
         let ops = parse_ops("Scale(0.5, 2, 1)").unwrap();
         assert_eq!(ops.len(), 1);
+    }
+
+    // ── Feature: Align ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_align_basic() {
+        let ops = parse_ops("Align(Y, Up)").unwrap();
+        assert_eq!(ops.len(), 1);
+        let ShapeOp::Align { local_axis, target } = &ops[0] else {
+            panic!("expected Align");
+        };
+        assert_eq!(*local_axis, Axis::Y);
+        assert!((*target - crate::scope::Vec3::new(0.0, 1.0, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_align_world_prefix() {
+        let ops = parse_ops("Align(Z, World.Forward)").unwrap();
+        let ShapeOp::Align { local_axis, target } = &ops[0] else {
+            panic!("expected Align");
+        };
+        assert_eq!(*local_axis, Axis::Z);
+        assert!((*target - crate::scope::Vec3::new(0.0, 0.0, -1.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_align_unknown_target_rejected() {
+        assert!(parse_ops("Align(Y, Sideways)").is_err());
+    }
+
+    // ── Feature: Offset ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_offset_basic() {
+        let ops = parse_ops("Offset(-0.2) { Inside: Glass | Border: Frame }").unwrap();
+        assert_eq!(ops.len(), 1);
+        let ShapeOp::Offset { distance, cases } = &ops[0] else {
+            panic!("expected Offset");
+        };
+        assert!((*distance - (-0.2)).abs() < 1e-9);
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].selector, OffsetSelector::Inside);
+        assert_eq!(cases[0].rule, "Glass");
+        assert_eq!(cases[1].selector, OffsetSelector::Border);
+        assert_eq!(cases[1].rule, "Frame");
+    }
+
+    #[test]
+    fn test_parse_offset_is_terminating() {
+        assert!(parse_ops("Offset(-0.1) { Inside: A } Scale(1, 2, 1)").is_err());
+    }
+
+    // ── Feature: Roof ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_roof_gable_no_overhang() {
+        let ops = parse_ops("Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }").unwrap();
+        assert_eq!(ops.len(), 1);
+        let ShapeOp::Roof {
+            roof_type,
+            angle,
+            overhang,
+            cases,
+        } = &ops[0]
+        else {
+            panic!("expected Roof");
+        };
+        assert_eq!(*roof_type, RoofType::Gable);
+        assert!((*angle - 30.0).abs() < 1e-9);
+        assert!((*overhang).abs() < 1e-9);
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].selector, RoofFaceSelector::Slope);
+        assert_eq!(cases[1].selector, RoofFaceSelector::GableEnd);
+    }
+
+    #[test]
+    fn test_parse_roof_hip_with_overhang() {
+        let ops = parse_ops("Roof(Hip, 45, 0.5) { Slope: Tiles }").unwrap();
+        let ShapeOp::Roof {
+            roof_type,
+            angle,
+            overhang,
+            ..
+        } = &ops[0]
+        else {
+            panic!("expected Roof");
+        };
+        assert_eq!(*roof_type, RoofType::Hip);
+        assert!((*angle - 45.0).abs() < 1e-9);
+        assert!((*overhang - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_roof_angle_out_of_range_rejected() {
+        assert!(parse_ops("Roof(Gable, 0) { Slope: Tiles }").is_err());
+        assert!(parse_ops("Roof(Gable, 90) { Slope: Tiles }").is_err());
+    }
+
+    #[test]
+    fn test_parse_roof_is_terminating() {
+        assert!(parse_ops("Roof(Shed, 30) { Slope: Tiles } Scale(1, 2, 1)").is_err());
     }
 }
