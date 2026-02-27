@@ -291,19 +291,29 @@ fn find_roof_rule(selector: RoofFaceSelector, cases: &[RoofCase]) -> Option<&str
 /// All rotations are expressed as deltas in the **parent scope's local frame**
 /// (composed as `scope.rotation * delta` to obtain the world-space rotation).
 ///
-/// Convention: Local X = across the ridge (world-horizontal), Local Y = up the slope.
+/// Convention: Local Z = outward normal (away from building), Local Y = up the slope,
+/// matching the `Comp(Faces)` face convention extended to tilted surfaces.
 ///
-/// - `front_rot`: slope rises toward +Z  (from front eave at z=0 up to ridge at z=sz/2)
-/// - `back_rot`:  slope rises toward -Z  (from back  eave at z=sz up to ridge at z=sz/2)
-/// - `left_rot`:  slope rises toward +X  (from left  eave at x=0 up to ridge at x=sx/2)
-/// - `right_rot`: slope rises toward -X  (from right eave at x=sx up to ridge at x=sx/2)
+/// - `front_rot`: outward normal = (0, cos α, −sin α) — up & forward (−Z world)
+/// - `back_rot`:  outward normal = (0, cos α, +sin α) — up & backward (+Z world)
+/// - `left_rot`:  outward normal = (−sin α, cos α, 0) — up & left (−X world)
+/// - `right_rot`: outward normal = (+sin α, cos α, 0) — up & right (+X world)
 fn roof_slope_rotations(alpha: f64) -> (Quat, Quat, Quat, Quat) {
-    let front_rot = Quat::from_axis_angle(Vec3::X, FRAC_PI_2 - alpha);
+    // front: mirror the Comp-Front face (flip X via Y-π rotation), then tilt the slope.
+    //   Local X = (−1, 0, 0), Local Z = (0, cos α, −sin α) — outward up & forward.
+    let front_rot =
+        Quat::from_axis_angle(Vec3::X, FRAC_PI_2 - alpha) * Quat::from_axis_angle(Vec3::Y, PI);
+    // back: identity orientation tilted by (α − π/2).
+    //   Local X = (+1, 0, 0), Local Z = (0, cos α, +sin α) — outward up & backward.
     let back_rot = Quat::from_axis_angle(Vec3::X, alpha - FRAC_PI_2);
-    // Left/right: rotate Local X to +Z, then tilt Local Y up the slope.
-    let tilt_y = Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2);
-    let left_rot = Quat::from_axis_angle(Vec3::Z, alpha - FRAC_PI_2) * tilt_y;
-    let right_rot = Quat::from_axis_angle(Vec3::Z, FRAC_PI_2 - alpha) * tilt_y;
+    // left: Comp-Left face orientation (Y, −π/2) then tilt.
+    //   Local X = (0, 0, +1), Local Z = (−sin α, cos α, 0) — outward up & left.
+    let left_rot = Quat::from_axis_angle(Vec3::Z, alpha - FRAC_PI_2)
+        * Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2);
+    // right: Comp-Right face orientation (Y, +π/2) then tilt.
+    //   Local X = (0, 0, −1), Local Z = (+sin α, cos α, 0) — outward up & right.
+    let right_rot = Quat::from_axis_angle(Vec3::Z, FRAC_PI_2 - alpha)
+        * Quat::from_axis_angle(Vec3::Y, FRAC_PI_2);
     (front_rot, back_rot, left_rot, right_rot)
 }
 
@@ -558,10 +568,19 @@ impl Interpreter {
                     // when vectors are antiparallel — handle that with a fallback 180°.
                     let dot = current.dot(target_norm);
                     let q = if (dot + 1.0).abs() < 1e-9 {
-                        let perp = if current.x.abs() < 0.9 {
+                        // Choose the cardinal axis least parallel to `current` (smallest
+                        // absolute component) to form the cross product. This avoids the
+                        // discontinuous snap caused by a hard threshold: the selection
+                        // only changes when two components are exactly equal, which is
+                        // rare and well-conditioned.
+                        let perp = if current.x.abs() <= current.y.abs()
+                            && current.x.abs() <= current.z.abs()
+                        {
                             current.cross(Vec3::X).normalize()
-                        } else {
+                        } else if current.y.abs() <= current.z.abs() {
                             current.cross(Vec3::Y).normalize()
+                        } else {
+                            current.cross(Vec3::Z).normalize()
                         };
                         Quat::from_axis_angle(perp, PI)
                     } else {
@@ -677,7 +696,7 @@ impl Interpreter {
                     type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, f64);
                     let panels: Vec<Panel> = match roof_type {
                         RoofType::Shed => vec![(
-                            Vec3::new(-o, sy, -o),
+                            Vec3::new(sx + o, sy, -o),
                             Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
                             front_rot,
                             RoofFaceSelector::Slope,
@@ -685,7 +704,7 @@ impl Interpreter {
                         )],
                         RoofType::Pyramid => vec![
                             (
-                                Vec3::new(-o, sy, -o),
+                                Vec3::new(sx + o, sy, -o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 front_rot,
                                 RoofFaceSelector::Slope,
@@ -706,7 +725,7 @@ impl Interpreter {
                                 1.0,
                             ),
                             (
-                                Vec3::new(sx + o, sy, -o),
+                                Vec3::new(sx + o, sy, sz + o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 right_rot,
                                 RoofFaceSelector::Slope,
@@ -722,7 +741,7 @@ impl Interpreter {
                             vec![
                                 // Two slope panels
                                 (
-                                    Vec3::new(-o, sy, -o),
+                                    Vec3::new(sx + o, sy, -o),
                                     Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                     front_rot,
                                     RoofFaceSelector::Slope,
@@ -754,7 +773,7 @@ impl Interpreter {
                         }
                         RoofType::Hip => vec![
                             (
-                                Vec3::new(-o, sy, -o),
+                                Vec3::new(sx + o, sy, -o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 front_rot,
                                 RoofFaceSelector::Slope,
@@ -775,7 +794,7 @@ impl Interpreter {
                                 1.0,
                             ),
                             (
-                                Vec3::new(sx + o, sy, -o),
+                                Vec3::new(sx + o, sy, sz + o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 right_rot,
                                 RoofFaceSelector::Slope,
@@ -894,6 +913,10 @@ impl Interpreter {
                 // along the outward face normal. Rules can then use Split(X/Y)
                 // or Repeat(X) naturally on any face of the parent volume.
                 ShapeOp::Comp(CompTarget::Faces(cases)) => {
+                    // face_descs always returns exactly 6 faces; guard before any push.
+                    if queue.len() + 6 > MAX_QUEUE {
+                        return Err(ShapeError::CapacityOverflow);
+                    }
                     for (selector, offset_local, face_size, rot_delta) in face_descs(scope.size) {
                         let rule = match find_face_rule(selector, cases) {
                             Some(r) => r,
@@ -1718,6 +1741,90 @@ mod tests {
                 t.taper
             );
         }
+    }
+
+    #[test]
+    fn test_roof_slope_normals_outward() {
+        // All four Hip slopes must have Local Z (= scope.rotation * Z) pointing
+        // AWAY from the building:
+        //   front  → (0,  cos α, −sin α)   back  → (0, cos α, +sin α)
+        //   left   → (−sin α, cos α,  0)   right → (+sin α, cos α,  0)
+        let alpha: f64 = 30_f64.to_radians();
+        let cos_a = alpha.cos();
+        let sin_a = alpha.sin();
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![ShapeOp::Roof {
+                roof_type: RoofType::Hip,
+                angle: 30.0,
+                overhang: 0.0,
+                cases: vec![crate::ops::RoofCase {
+                    selector: RoofFaceSelector::Slope,
+                    rule: "S".to_string(),
+                }],
+            }],
+        );
+        let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 4.0, 8.0));
+        let model = interp.derive(scope, "R").unwrap();
+        assert_eq!(model.len(), 4);
+        let normals: Vec<Vec3> = model
+            .terminals
+            .iter()
+            .map(|t| t.scope.rotation * Vec3::Z)
+            .collect();
+        let expected = [
+            Vec3::new(0.0, cos_a, -sin_a), // front: up & forward
+            Vec3::new(0.0, cos_a, sin_a),  // back:  up & backward
+            Vec3::new(-sin_a, cos_a, 0.0), // left:  up & left
+            Vec3::new(sin_a, cos_a, 0.0),  // right: up & right
+        ];
+        for exp in &expected {
+            assert!(
+                normals.iter().any(|n| (*n - *exp).length() < 1e-6),
+                "missing outward normal {:?}; got {:?}",
+                exp,
+                normals
+            );
+        }
+        // All normals must have a positive Y component (point upward).
+        for n in &normals {
+            assert!(n.y > 0.0, "normal pointing downward: {:?}", n);
+        }
+    }
+
+    #[test]
+    fn test_align_antiparallel_fallback_no_nan() {
+        // When the local axis is exactly anti-parallel to the target, the fallback
+        // 180° rotation must produce a unit quaternion, not NaN.
+        // Rotate scope so local Y = −Y (anti-parallel to world Up), then Align(Y, Up).
+        let flip_y = Quat::from_axis_angle(Vec3::Z, PI);
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "R",
+            vec![
+                ShapeOp::Rotate(flip_y),
+                ShapeOp::Align {
+                    local_axis: Axis::Y,
+                    target: Vec3::Y,
+                },
+                ShapeOp::I("M".to_string()),
+            ],
+        );
+        let model = interp.derive(Scope::unit(), "R").unwrap();
+        let world_y = model.terminals[0].scope.rotation * Vec3::Y;
+        assert!(
+            (world_y - Vec3::Y).length() < 1e-6,
+            "anti-parallel Align should point Y to world up, got {:?}",
+            world_y
+        );
+        // Quaternion must remain unit.
+        let r = model.terminals[0].scope.rotation;
+        assert!(
+            (r.length_squared() - 1.0).abs() < 1e-9,
+            "rotation not unit: length_sq={}",
+            r.length_squared()
+        );
     }
 
     #[test]
