@@ -518,6 +518,11 @@ impl Interpreter {
                         return Err(ShapeError::InvalidNumericValue);
                     }
                     scope.position += scope.rotation * *v;
+                    // Two individually-finite values can add to INFINITY
+                    // (e.g. f64::MAX/2 + f64::MAX/2). Catch the overflow here.
+                    if !scope.position.is_finite() {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
                 }
 
                 ShapeOp::Scale(v) => {
@@ -539,7 +544,12 @@ impl Interpreter {
 
                 // ── Transform: Align ─────────────────────────────────────
                 ShapeOp::Align { local_axis, target } => {
-                    if !target.is_finite() || target.length_squared() < 1e-12 {
+                    // length_squared() can overflow to INFINITY for large-but-finite
+                    // vectors (e.g. (1e200, 1e200, 1e200)); INFINITY > 1e-12 so the
+                    // naive check would pass, then normalize() divides by INFINITY
+                    // yielding a zero vector and a silent no-op rotation.
+                    let len_sq = target.length_squared();
+                    if !target.is_finite() || !len_sq.is_finite() || len_sq < 1e-12 {
                         return Err(ShapeError::InvalidAlignTarget);
                     }
                     let target_norm = target.normalize();
@@ -574,7 +584,12 @@ impl Interpreter {
                     let sy = scope.size.y;
                     let inside_w = sx - 2.0 * inset;
                     let inside_h = sy - 2.0 * inset;
-                    if inside_w < 0.0 || inside_h < 0.0 {
+                    // Explicit NaN guard: if sx/sy are non-finite (e.g. leaked
+                    // Infinity from an upstream op), the subtraction produces NaN,
+                    // which compares false for `< 0.0` and would bypass the check.
+                    if !inside_w.is_finite() || !inside_h.is_finite()
+                        || inside_w < 0.0 || inside_h < 0.0
+                    {
                         return Err(ShapeError::OffsetTooLarge);
                     }
                     if let Some(rule) = find_offset_rule(OffsetSelector::Inside, cases) {
@@ -649,6 +664,11 @@ impl Interpreter {
                     // slope_lengths: (fb = front/back depth, lr = left/right depth)
                     let fb_len = (sz / 2.0 + o) / cos_a;
                     let lr_len = (sx / 2.0 + o) / cos_a;
+                    // Large scope sizes or near-90° angles can overflow cos_a (≈0)
+                    // division to INFINITY. Catch before baking into child scopes.
+                    if !fb_len.is_finite() || !lr_len.is_finite() {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
 
                     // Each panel: (local_offset, face_size, rot_delta, selector, taper)
                     type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, f64);
@@ -692,6 +712,10 @@ impl Interpreter {
                         ],
                         RoofType::Gable => {
                             let h = (sz / 2.0) * alpha.tan();
+                            // Near-90° angles cause tan() to overflow to INFINITY.
+                            if !h.is_finite() {
+                                return Err(ShapeError::InvalidNumericValue);
+                            }
                             vec![
                                 // Two slope panels
                                 (
@@ -821,6 +845,12 @@ impl Interpreter {
                         Axis::Y => scope.size.y,
                         Axis::Z => scope.size.z,
                     };
+                    // Defensive: scope.size should always be finite after earlier
+                    // checks, but if an Infinity scope size ever sneaks through
+                    // (e.g. from a Roof child), `0.0 * Infinity = NaN` at i=0.
+                    if !total.is_finite() || total <= 0.0 {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
                     // `total / tile_size` can overflow to INFINITY for very small
                     // tile_size values (e.g. f64::MIN_POSITIVE). The subsequent
                     // `as usize` cast would saturate to usize::MAX, and

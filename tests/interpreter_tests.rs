@@ -1,6 +1,7 @@
 use symbios_shape::grammar::parse_ops;
 use symbios_shape::ops::{
-    Axis, CompFaceCase, CompTarget, FaceSelector, ShapeOp, SplitSize, SplitSlot,
+    Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase,
+    RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
 };
 use symbios_shape::{Interpreter, Quat, Scope, ShapeError, Vec3};
 
@@ -394,4 +395,131 @@ fn parse_and_derive_building() {
     assert!((model.terminals[0].scope.size.y - 3.0).abs() < 1e-9);
     assert_eq!(model.terminals[2].mesh_id, "Roof");
     assert!((model.terminals[2].taper - 0.8).abs() < 1e-9);
+}
+
+// ── Infinity / NaN propagation guards ────────────────────────────────────────
+
+/// Issue 1: large-but-finite translate vectors that overflow position to Infinity.
+/// MAX/2 + MAX/2 = MAX (still finite); MAX + MAX = Infinity (caught).
+#[test]
+fn translate_overflow_to_infinity_rejected() {
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![
+            ShapeOp::Translate(Vec3::new(f64::MAX, 0.0, 0.0)),
+            ShapeOp::Translate(Vec3::new(f64::MAX, 0.0, 0.0)),
+            ShapeOp::I("Leaf".to_string()),
+        ],
+    );
+    assert!(matches!(
+        interp.derive(unit_scope(), "R"),
+        Err(ShapeError::InvalidNumericValue)
+    ));
+}
+
+/// Issue 2: Align target whose length_squared overflows to Infinity must be rejected.
+#[test]
+fn align_large_target_length_sq_overflow_rejected() {
+    let mut interp = Interpreter::new();
+    // (1e200, 1e200, 1e200) is finite component-wise but length_squared = 3e400 = Infinity.
+    interp.add_rule(
+        "R",
+        vec![
+            ShapeOp::Align {
+                local_axis: Axis::Y,
+                target: Vec3::new(1e200, 1e200, 1e200),
+            },
+            ShapeOp::I("Leaf".to_string()),
+        ],
+    );
+    assert!(matches!(
+        interp.derive(unit_scope(), "R"),
+        Err(ShapeError::InvalidAlignTarget)
+    ));
+}
+
+/// Issue 3: A steep-but-valid angle (89°) combined with a very large scope depth
+/// causes `fb_len = (sz/2) / cos(89°)` to overflow to Infinity.
+/// With sz=1e307: 5e306 / 0.01745 ≈ 2.87e308 > f64::MAX → Infinity.
+#[test]
+fn roof_trig_overflow_large_scope_rejected() {
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Roof {
+            roof_type: RoofType::Gable,
+            angle: 89.0,
+            overhang: 0.0,
+            cases: vec![RoofCase {
+                selector: RoofFaceSelector::Slope,
+                rule: "Tiles".to_string(),
+            }],
+        }],
+    );
+    let big_scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 0.0, 1e307));
+    assert!(matches!(
+        interp.derive(big_scope, "R"),
+        Err(ShapeError::InvalidNumericValue)
+    ));
+}
+
+/// Issue 3 (variant): a large-but-finite overhang overflows slope length.
+/// overhang = MAX*0.9 → (MAX*0.9) / cos(45°) ≈ MAX*1.27 → Infinity.
+#[test]
+fn roof_large_overhang_overflow_rejected() {
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Roof {
+            roof_type: RoofType::Pyramid,
+            angle: 45.0,
+            overhang: f64::MAX * 0.9,
+            cases: vec![RoofCase {
+                selector: RoofFaceSelector::Slope,
+                rule: "Tiles".to_string(),
+            }],
+        }],
+    );
+    assert!(matches!(
+        interp.derive(unit_scope(), "R"),
+        Err(ShapeError::InvalidNumericValue)
+    ));
+}
+
+/// Issue 4: Repeat with a non-finite scope size (defensive guard).
+#[test]
+fn repeat_non_finite_total_rejected() {
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Repeat {
+            axis: Axis::X,
+            tile_size: 1.0,
+            rule: "Leaf".to_string(),
+        }],
+    );
+    // Construct a scope with an Infinity X size, bypassing the normal API.
+    let bad_scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(f64::INFINITY, 1.0, 1.0));
+    // The scope fails validate() first (Infinity size), which is fine — the guard fires.
+    assert!(interp.derive(bad_scope, "R").is_err());
+}
+
+/// Issue 5: Offset with NaN scope dimensions must not bypass the boundary check.
+#[test]
+fn offset_nan_scope_size_rejected() {
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Offset {
+            distance: -0.2,
+            cases: vec![OffsetCase {
+                selector: OffsetSelector::Inside,
+                rule: "Leaf".to_string(),
+            }],
+        }],
+    );
+    let nan_scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(f64::NAN, 1.0, 1.0));
+    // validate() catches NaN scope size before we even reach Offset — either way, an error.
+    assert!(interp.derive(nan_scope, "R").is_err());
 }
