@@ -500,7 +500,11 @@ fn repeat_non_finite_total_rejected() {
         }],
     );
     // Construct a scope with an Infinity X size, bypassing the normal API.
-    let bad_scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(f64::INFINITY, 1.0, 1.0));
+    let bad_scope = Scope::new(
+        Vec3::ZERO,
+        Quat::IDENTITY,
+        Vec3::new(f64::INFINITY, 1.0, 1.0),
+    );
     // The scope fails validate() first (Infinity size), which is fine — the guard fires.
     assert!(interp.derive(bad_scope, "R").is_err());
 }

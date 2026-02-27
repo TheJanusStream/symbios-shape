@@ -587,8 +587,10 @@ impl Interpreter {
                     // Explicit NaN guard: if sx/sy are non-finite (e.g. leaked
                     // Infinity from an upstream op), the subtraction produces NaN,
                     // which compares false for `< 0.0` and would bypass the check.
-                    if !inside_w.is_finite() || !inside_h.is_finite()
-                        || inside_w < 0.0 || inside_h < 0.0
+                    if !inside_w.is_finite()
+                        || !inside_h.is_finite()
+                        || inside_w < 0.0
+                        || inside_h < 0.0
                     {
                         return Err(ShapeError::OffsetTooLarge);
                     }
@@ -597,12 +599,11 @@ impl Interpreter {
                             return Err(ShapeError::CapacityOverflow);
                         }
                         let pos = scope.position + scope.rotation * Vec3::new(inset, inset, 0.0);
+                        let child_scope =
+                            Scope::new(pos, scope.rotation, Vec3::new(inside_w, inside_h, 0.0));
+                        child_scope.validate()?;
                         queue.push_back(WorkItem {
-                            scope: Scope::new(
-                                pos,
-                                scope.rotation,
-                                Vec3::new(inside_w, inside_h, 0.0),
-                            ),
+                            scope: child_scope,
                             rule: rule.to_string(),
                             depth: depth + 1,
                             taper: 0.0,
@@ -628,8 +629,10 @@ impl Interpreter {
                         }
                         for (local_off, strip_size) in strips {
                             let pos = scope.position + scope.rotation * local_off;
+                            let child_scope = Scope::new(pos, scope.rotation, strip_size);
+                            child_scope.validate()?;
                             queue.push_back(WorkItem {
-                                scope: Scope::new(pos, scope.rotation, strip_size),
+                                scope: child_scope,
                                 rule: rule.to_string(),
                                 depth: depth + 1,
                                 taper: 0.0,
@@ -790,8 +793,10 @@ impl Interpreter {
                         };
                         let face_pos = scope.position + scope.rotation * local_off;
                         let face_rot = (scope.rotation * rot_delta).normalize();
+                        let face_scope = Scope::new(face_pos, face_rot, face_size);
+                        face_scope.validate()?;
                         queue.push_back(WorkItem {
-                            scope: Scope::new(face_pos, face_rot, face_size),
+                            scope: face_scope,
                             rule: rule.to_string(),
                             depth: depth + 1,
                             taper: panel_taper,
@@ -815,6 +820,7 @@ impl Interpreter {
                     let mut offset = 0.0;
                     for (slot, size) in slots.iter().zip(sizes.iter()) {
                         let child = slice_scope(&scope, *axis, offset, *size);
+                        child.validate()?;
                         queue.push_back(WorkItem {
                             scope: child,
                             rule: slot.rule.clone(),
@@ -869,6 +875,7 @@ impl Interpreter {
                         for i in 0..n_tiles {
                             let offset = i as f64 * actual_size;
                             let child = slice_scope(&scope, *axis, offset, actual_size);
+                            child.validate()?;
                             queue.push_back(WorkItem {
                                 scope: child,
                                 rule: rule.clone(),
@@ -895,6 +902,7 @@ impl Interpreter {
                         let face_pos = scope.position + scope.rotation * offset_local;
                         let face_rotation = scope.rotation * rot_delta;
                         let face_scope = Scope::new(face_pos, face_rotation, face_size);
+                        face_scope.validate()?;
                         queue.push_back(WorkItem {
                             scope: face_scope,
                             rule: rule.to_string(),
