@@ -58,6 +58,30 @@ fn extrude_sets_y_size() {
     assert!((model.terminals[0].scope.size.y - 7.5).abs() < 1e-9);
 }
 
+#[test]
+fn extrude_on_face_scope_sets_z_size() {
+    // Face scopes from Comp(Faces) have size.z == 0 and size.y == face height.
+    // Extrude should push the face outward along its normal (local Z), not
+    // overwrite the height (size.y).
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Extrude(0.2), ShapeOp::I("Wall".to_string())],
+    );
+    let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(4.0, 3.0, 0.0));
+    let model = interp.derive(scope, "R").unwrap();
+    assert!(
+        (model.terminals[0].scope.size.z - 0.2).abs() < 1e-9,
+        "expected size.z = 0.2, got {}",
+        model.terminals[0].scope.size.z
+    );
+    assert!(
+        (model.terminals[0].scope.size.y - 3.0).abs() < 1e-9,
+        "face height must be preserved, got {}",
+        model.terminals[0].scope.size.y
+    );
+}
+
 // ── Taper ─────────────────────────────────────────────────────────────────────
 
 #[test]

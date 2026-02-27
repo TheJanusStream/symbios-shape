@@ -499,7 +499,16 @@ impl Interpreter {
                     if !h.is_finite() || *h <= 0.0 {
                         return Err(ShapeError::InvalidNumericValue);
                     }
-                    scope.size.y = *h;
+                    // Face scopes from Comp(Faces) have size.z == 0 (the outward-normal
+                    // direction) and a non-zero size.y (the face height).  Extruding a
+                    // face scope should push it outward along the normal (local Z), not
+                    // collapse the height by overwriting size.y.
+                    // Footprint scopes have size.y == 0; Extrude gives them their height.
+                    if scope.size.z.abs() < 1e-9 && scope.size.y.abs() > 1e-9 {
+                        scope.size.z = *h;
+                    } else {
+                        scope.size.y = *h;
+                    }
                 }
 
                 ShapeOp::Taper(amount) => {
