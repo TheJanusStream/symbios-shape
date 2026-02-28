@@ -11,6 +11,7 @@ use std::f64::consts::{FRAC_PI_2, PI};
 
 use rand::SeedableRng;
 use rand_pcg::Pcg64;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ShapeError;
 use crate::model::{ShapeModel, Terminal};
@@ -28,6 +29,7 @@ const MAX_TERMINALS: usize = 100_000;
 // ── Weighted rule variant ─────────────────────────────────────────────────────
 
 /// One alternative in a stochastic or deterministic rule.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WeightedVariant {
     /// Relative weight (need not sum to 1.0 across variants).
     pub weight: f64,
@@ -371,6 +373,18 @@ impl Interpreter {
             max_terminals: MAX_TERMINALS,
             seed: 0,
         }
+    }
+
+    /// Returns a reference to the full rule table (rule name → weighted variants).
+    pub fn rules(&self) -> &HashMap<String, Vec<WeightedVariant>> {
+        &self.rules
+    }
+
+    /// Directly inserts a pre-built variant list for `name`, bypassing weight validation.
+    ///
+    /// Intended for restoring snapshots produced by [`ShapeGenotype::to_interpreter`].
+    pub fn set_variants(&mut self, name: impl Into<String>, variants: Vec<WeightedVariant>) {
+        self.rules.insert(name.into(), variants);
     }
 
     /// Registers a deterministic production rule.

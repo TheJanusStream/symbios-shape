@@ -38,6 +38,7 @@
 //! ```
 
 pub mod error;
+pub mod genetics;
 pub mod grammar;
 pub mod interpreter;
 pub mod model;
