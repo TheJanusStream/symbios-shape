@@ -195,7 +195,9 @@ fn mutate_op<R: Rng>(op: &mut ShapeOp, rng: &mut R, rate: f32) {
         ShapeOp::Repeat { tile_size, .. } => {
             *tile_size = jitter(rng, rate, *tile_size, 0.3).max(0.1);
         }
-        ShapeOp::Roof { angle, overhang, .. } => {
+        ShapeOp::Roof {
+            angle, overhang, ..
+        } => {
             *angle = jitter(rng, rate, *angle, 5.0).clamp(1.0, 89.0);
             *overhang = jitter(rng, rate, *overhang, 0.2).clamp(0.0, 2.0);
         }
@@ -220,7 +222,11 @@ fn mutate_split_size<R: Rng>(size: &mut SplitSize, rng: &mut R, rate: f32) {
 
 // ── Per-variant crossover ─────────────────────────────────────────────────────
 
-fn crossover_variant<R: Rng>(a: &WeightedVariant, b: &WeightedVariant, rng: &mut R) -> WeightedVariant {
+fn crossover_variant<R: Rng>(
+    a: &WeightedVariant,
+    b: &WeightedVariant,
+    rng: &mut R,
+) -> WeightedVariant {
     if same_structure(&a.ops, &b.ops) {
         let ops = a
             .ops
@@ -234,7 +240,11 @@ fn crossover_variant<R: Rng>(a: &WeightedVariant, b: &WeightedVariant, rng: &mut
         }
     } else {
         // Topologies differ — uniform crossover: pick one parent whole.
-        if rng.random::<f32>() < 0.5 { a.clone() } else { b.clone() }
+        if rng.random::<f32>() < 0.5 {
+            a.clone()
+        } else {
+            b.clone()
+        }
     }
 }
 
@@ -301,7 +311,13 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             blx(va.y, vb.y, 0.5, rng),
             blx(va.z, vb.z, 0.5, rng),
         )),
-        (ShapeOp::Split { axis, slots: slots_a }, ShapeOp::Split { slots: slots_b, .. }) => {
+        (
+            ShapeOp::Split {
+                axis,
+                slots: slots_a,
+            },
+            ShapeOp::Split { slots: slots_b, .. },
+        ) => {
             // Blend slot sizes pairwise; keep rules and axis from parent A.
             let slots = if slots_a.len() == slots_b.len() {
                 slots_a
@@ -318,7 +334,11 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             ShapeOp::Split { axis: *axis, slots }
         }
         (
-            ShapeOp::Repeat { axis, tile_size: tsa, rule },
+            ShapeOp::Repeat {
+                axis,
+                tile_size: tsa,
+                rule,
+            },
             ShapeOp::Repeat { tile_size: tsb, .. },
         ) => ShapeOp::Repeat {
             axis: *axis,
@@ -326,8 +346,17 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             rule: rule.clone(),
         },
         (
-            ShapeOp::Roof { roof_type, angle: aa, overhang: oa, cases },
-            ShapeOp::Roof { angle: ab, overhang: ob, .. },
+            ShapeOp::Roof {
+                roof_type,
+                angle: aa,
+                overhang: oa,
+                cases,
+            },
+            ShapeOp::Roof {
+                angle: ab,
+                overhang: ob,
+                ..
+            },
         ) => ShapeOp::Roof {
             roof_type: *roof_type,
             angle: blx(*aa, *ab, 0.5, rng).clamp(1.0, 89.0),
@@ -366,7 +395,10 @@ mod tests {
 
     fn build_interp() -> Interpreter {
         let mut interp = Interpreter::new();
-        interp.add_rule("Lot", parse_ops("Extrude(10) Split(Y) { 3: Floor | ~1: Top }").unwrap());
+        interp.add_rule(
+            "Lot",
+            parse_ops("Extrude(10) Split(Y) { 3: Floor | ~1: Top }").unwrap(),
+        );
         interp.add_rule("Floor", parse_ops(r#"Taper(0.0) I("Floor")"#).unwrap());
         interp.add_rule("Top", parse_ops(r#"Taper(0.8) I("Roof")"#).unwrap());
         interp
@@ -411,7 +443,10 @@ mod tests {
         let interp_a = build_interp();
         let mut interp_b = build_interp();
         // Give parent B different parameters.
-        interp_b.add_rule("Lot", parse_ops("Extrude(20) Split(Y) { 5: Floor | ~2: Top }").unwrap());
+        interp_b.add_rule(
+            "Lot",
+            parse_ops("Extrude(20) Split(Y) { 5: Floor | ~2: Top }").unwrap(),
+        );
 
         let dna_a = ShapeGenotype::from_interpreter(&interp_a);
         let dna_b = ShapeGenotype::from_interpreter(&interp_b);
