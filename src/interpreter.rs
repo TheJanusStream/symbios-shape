@@ -691,6 +691,7 @@ impl Interpreter {
                     let alpha = angle.to_radians();
                     let cos_a = alpha.cos();
                     let (front_rot, back_rot, left_rot, right_rot) = roof_slope_rotations(alpha);
+                    let y_anchor = -o * alpha.tan();
 
                     // slope_lengths: (fb = front/back depth, lr = left/right depth)
                     let fb_len = (sz / 2.0 + o) / cos_a;
@@ -705,7 +706,7 @@ impl Interpreter {
                     type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, f64);
                     let panels: Vec<Panel> = match roof_type {
                         RoofType::Shed => vec![(
-                            Vec3::new(sx + o, 0.0, -o),
+                            Vec3::new(sx + o, y_anchor, -o),
                             Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
                             front_rot,
                             RoofFaceSelector::Slope,
@@ -713,28 +714,28 @@ impl Interpreter {
                         )],
                         RoofType::Pyramid => vec![
                             (
-                                Vec3::new(sx + o, 0.0, -o),
+                                Vec3::new(sx + o, y_anchor, -o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 front_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(-o, 0.0, sz + o),
+                                Vec3::new(-o, y_anchor, sz + o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 back_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(-o, 0.0, -o),
+                                Vec3::new(-o, y_anchor, -o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 left_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(sx + o, 0.0, sz + o),
+                                Vec3::new(sx + o, y_anchor, sz + o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 right_rot,
                                 RoofFaceSelector::Slope,
@@ -750,14 +751,14 @@ impl Interpreter {
                             vec![
                                 // Two slope panels
                                 (
-                                    Vec3::new(sx + o, 0.0, -o),
+                                    Vec3::new(sx + o, y_anchor, -o),
                                     Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                     front_rot,
                                     RoofFaceSelector::Slope,
                                     0.0,
                                 ),
                                 (
-                                    Vec3::new(-o, 0.0, sz + o),
+                                    Vec3::new(-o, y_anchor, sz + o),
                                     Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                     back_rot,
                                     RoofFaceSelector::Slope,
@@ -769,41 +770,41 @@ impl Interpreter {
                                     Vec3::new(sz, h, 0.0),
                                     Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
                                     RoofFaceSelector::GableEnd,
-                                    0.0,
+                                    1.0,
                                 ),
                                 (
                                     Vec3::new(sx, 0.0, sz),
                                     Vec3::new(sz, h, 0.0),
                                     Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
                                     RoofFaceSelector::GableEnd,
-                                    0.0,
+                                    1.0,
                                 ),
                             ]
                         }
                         RoofType::Hip => vec![
                             (
-                                Vec3::new(sx + o, 0.0, -o),
+                                Vec3::new(sx + o, y_anchor, -o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 front_rot,
                                 RoofFaceSelector::Slope,
                                 0.0,
                             ),
                             (
-                                Vec3::new(-o, 0.0, sz + o),
+                                Vec3::new(-o, y_anchor, sz + o),
                                 Vec3::new(sx + 2.0 * o, fb_len, 0.0),
                                 back_rot,
                                 RoofFaceSelector::Slope,
                                 0.0,
                             ),
                             (
-                                Vec3::new(-o, 0.0, -o),
+                                Vec3::new(-o, y_anchor, -o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 left_rot,
                                 RoofFaceSelector::Slope,
                                 1.0,
                             ),
                             (
-                                Vec3::new(sx + o, 0.0, sz + o),
+                                Vec3::new(sx + o, y_anchor, sz + o),
                                 Vec3::new(sz + 2.0 * o, lr_len, 0.0),
                                 right_rot,
                                 RoofFaceSelector::Slope,
