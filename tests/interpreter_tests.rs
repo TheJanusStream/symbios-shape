@@ -1,8 +1,8 @@
 use symbios_shape::grammar::parse_ops;
 use symbios_shape::model::FaceProfile;
 use symbios_shape::ops::{
-    Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase,
-    RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
+    Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase, RoofConfig,
+    RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
 };
 use symbios_shape::{Interpreter, Quat, Scope, ShapeError, Vec3};
 
@@ -93,7 +93,9 @@ fn taper_propagates_to_terminal() {
         vec![ShapeOp::Taper(0.6), ShapeOp::I("Cone".to_string())],
     );
     let model = interp.derive(unit_scope(), "R").unwrap();
-    assert!(matches!(model.terminals[0].face_profile, FaceProfile::Taper(t) if (t - 0.6).abs() < 1e-9));
+    assert!(
+        matches!(model.terminals[0].face_profile, FaceProfile::Taper(t) if (t - 0.6).abs() < 1e-9)
+    );
 }
 
 #[test]
@@ -419,7 +421,9 @@ fn parse_and_derive_building() {
     assert_eq!(model.terminals[0].mesh_id, "GroundFloor");
     assert!((model.terminals[0].scope.size.y - 3.0).abs() < 1e-9);
     assert_eq!(model.terminals[2].mesh_id, "Roof");
-    assert!(matches!(model.terminals[2].face_profile, FaceProfile::Taper(t) if (t - 0.8).abs() < 1e-9));
+    assert!(
+        matches!(model.terminals[2].face_profile, FaceProfile::Taper(t) if (t - 0.8).abs() < 1e-9)
+    );
 }
 
 // ── Infinity / NaN propagation guards ────────────────────────────────────────

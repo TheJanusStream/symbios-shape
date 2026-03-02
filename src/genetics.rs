@@ -349,7 +349,10 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             let mut config = ca.clone();
             config.pitch = blx(ca.pitch, cb.pitch, 0.5, rng).clamp(1.0, 89.0);
             config.overhang = blx(ca.overhang, cb.overhang, 0.5, rng).clamp(0.0, 2.0);
-            ShapeOp::Roof { config, cases: cases.clone() }
+            ShapeOp::Roof {
+                config,
+                cases: cases.clone(),
+            }
         }
         // Non-parametric or unblendable: use parent A unchanged.
         _ => a.clone(),

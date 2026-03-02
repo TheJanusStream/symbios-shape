@@ -66,7 +66,10 @@ fn main() {
             s.size.y,
             s.size.z,
         );
-        if !matches!(terminal.face_profile, symbios_shape::model::FaceProfile::Rectangle) {
+        if !matches!(
+            terminal.face_profile,
+            symbios_shape::model::FaceProfile::Rectangle
+        ) {
             print!("  profile={:?}", terminal.face_profile);
         }
         println!();

@@ -446,12 +446,10 @@ fn parse_roof_case(input: &str) -> IResult<&str, RoofCase> {
 
 /// Parses an optional named parameter `key=value` after the positional args.
 /// Returns `Some(value)` if the key matches, `None` otherwise (does not consume input).
-fn parse_named_float<'a>(
-    key: &'static str,
-    input: &'a str,
-) -> IResult<&'a str, Option<f64>> {
+fn parse_named_float<'a>(key: &'static str, input: &'a str) -> IResult<&'a str, Option<f64>> {
     // Try `key=value` (after a leading comma which is consumed by the caller).
-    let result: IResult<&str, (&str, f64)> = (ws(tag(key)), preceded(ws(c_char('=')), ws(finite_float))).parse(input);
+    let result: IResult<&str, (&str, f64)> =
+        (ws(tag(key)), preceded(ws(c_char('=')), ws(finite_float))).parse(input);
     match result {
         Ok((rest, (_, v))) => Ok((rest, Some(v))),
         Err(_) => Ok((input, None)),
@@ -460,7 +458,18 @@ fn parse_named_float<'a>(
 
 /// Parses named parameters for Roof in any order: `overhang=N`, `offset=N`, `tier=N`, `fascia=N`, `secondary=N`.
 /// Each is preceded by a comma that must already be consumed by the caller before each attempt.
-fn parse_roof_named_params(input: &str) -> IResult<&str, (Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+fn parse_roof_named_params(
+    input: &str,
+) -> IResult<
+    &str,
+    (
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+    ),
+> {
     let mut remaining = input;
     let mut overhang: Option<f64> = None;
     let mut offset: Option<f64> = None;
