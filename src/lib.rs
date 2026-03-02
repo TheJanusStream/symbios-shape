@@ -34,7 +34,7 @@
 //! assert_eq!(model.len(), 3);
 //! assert_eq!(model.terminals[0].mesh_id, "GroundFloor");
 //! assert_eq!(model.terminals[2].mesh_id, "Roof");
-//! assert!((model.terminals[2].taper - 0.8).abs() < 1e-9);
+//! assert!(matches!(model.terminals[2].face_profile, symbios_shape::FaceProfile::Taper(t) if (t - 0.8).abs() < 1e-9));
 //! ```
 
 pub mod error;
@@ -47,9 +47,9 @@ pub mod scope;
 
 pub use error::ShapeError;
 pub use interpreter::Interpreter;
-pub use model::{ShapeModel, Terminal};
+pub use model::{FaceProfile, ShapeModel, Terminal};
 pub use ops::{
-    Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase, RoofFaceSelector,
-    RoofType, ShapeOp, SplitSize, SplitSlot,
+    AttachCase, AttachSelector, Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector,
+    RoofCase, RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
 };
 pub use scope::{Quat, Scope, Vec3};

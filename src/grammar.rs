@@ -28,8 +28,9 @@ use nom::{
 
 use crate::error::ShapeError;
 use crate::ops::{
-    Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase,
-    RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
+    AttachCase, AttachSelector, Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase,
+    OffsetSelector, RoofCase, RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize,
+    SplitSlot,
 };
 use crate::scope::{Quat, Vec3};
 
@@ -443,8 +444,70 @@ fn parse_roof_case(input: &str) -> IResult<&str, RoofCase> {
     Ok((input, RoofCase { selector, rule }))
 }
 
+/// Parses an optional named parameter `key=value` after the positional args.
+/// Returns `Some(value)` if the key matches, `None` otherwise (does not consume input).
+fn parse_named_float<'a>(
+    key: &'static str,
+    input: &'a str,
+) -> IResult<&'a str, Option<f64>> {
+    // Try `key=value` (after a leading comma which is consumed by the caller).
+    let result: IResult<&str, (&str, f64)> = (ws(tag(key)), preceded(ws(c_char('=')), ws(finite_float))).parse(input);
+    match result {
+        Ok((rest, (_, v))) => Ok((rest, Some(v))),
+        Err(_) => Ok((input, None)),
+    }
+}
+
+/// Parses named parameters for Roof in any order: `overhang=N`, `offset=N`, `tier=N`, `fascia=N`, `secondary=N`.
+/// Each is preceded by a comma that must already be consumed by the caller before each attempt.
+fn parse_roof_named_params(input: &str) -> IResult<&str, (Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+    let mut remaining = input;
+    let mut overhang: Option<f64> = None;
+    let mut offset: Option<f64> = None;
+    let mut tier: Option<f64> = None;
+    let mut fascia: Option<f64> = None;
+    let mut secondary: Option<f64> = None;
+
+    loop {
+        // Attempt to consume a comma.
+        let Ok((after_comma, _)) = ws::<_, _, Error<&str>>(c_char(',')).parse(remaining) else {
+            break;
+        };
+        // Try each named param.
+        let mut matched = false;
+        for (key, slot) in [
+            ("overhang", &mut overhang),
+            ("offset", &mut offset),
+            ("tier", &mut tier),
+            ("fascia", &mut fascia),
+            ("secondary", &mut secondary),
+        ] {
+            if let Ok((rest, Some(v))) = parse_named_float(key, after_comma) {
+                *slot = Some(v);
+                remaining = rest;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+    Ok((remaining, (overhang, offset, tier, fascia, secondary)))
+}
+
+/// Whether a `RoofType` uses the third positional argument as `secondary_pitch`
+/// rather than `overhang`.
+fn roof_type_uses_secondary_pitch(rt: RoofType) -> bool {
+    matches!(rt, RoofType::Gambrel | RoofType::Mansard)
+}
+
 /// `Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }`
 /// `Roof(Hip, 30, 0.5) { Slope: Tiles }`
+/// `Roof(Gambrel, 45, 20) { LowerSlope: Shingles | UpperSlope: Tiles }`
+/// `Roof(Saltbox, 45, offset=0.3) { Slope: Tiles | GableEnd: Bricks }`
+/// `Roof(DutchGable, 45, tier=0.7) { Slope: Tiles | GableEnd: Bricks }`
+/// `Roof(Mansard, 60, 20, tier=0.4) { LowerSlope: Plaster | UpperSlope: Tiles }`
 fn parse_roof(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Roof").parse(input)?;
     let (input, _) = cut(ws(c_char('('))).parse(input)?;
@@ -452,17 +515,61 @@ fn parse_roof(input: &str) -> IResult<&str, ShapeOp> {
     let roof_type = RoofType::parse(type_str)
         .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Tag)))?;
     let (input, _) = cut(ws(c_char(','))).parse(input)?;
-    let (input, angle) = cut(ws(finite_float)).parse(input)?;
-    if angle <= 0.0 || angle >= 90.0 {
+    let (input, pitch) = cut(ws(finite_float)).parse(input)?;
+    if pitch <= 0.0 || pitch >= 90.0 {
         return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
     }
-    // Optional overhang argument.
-    let (input, overhang) = opt(preceded(ws(c_char(',')), ws(finite_float))).parse(input)?;
-    let overhang = overhang.unwrap_or(0.0);
-    if overhang < 0.0 {
-        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+
+    // Optional second positional arg: secondary_pitch for Gambrel/Mansard, overhang for others.
+    let uses_secondary = roof_type_uses_secondary_pitch(roof_type);
+    let mut secondary_pitch: Option<f64> = None;
+    let mut overhang = 0.0_f64;
+
+    let (input, second_positional) =
+        opt(preceded(ws(c_char(',')), ws(finite_float))).parse(input)?;
+
+    // Peek ahead: if the next token after the comma is `key=`, it is a named param not positional.
+    // We handle this by checking if what we parsed looks like a named-param key.
+    // Since `finite_float` already consumed a number (not `key=`), we can trust second_positional
+    // is a number when Some.
+    if let Some(v) = second_positional {
+        if uses_secondary {
+            secondary_pitch = Some(v);
+        } else {
+            if v < 0.0 {
+                return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+            }
+            overhang = v;
+        }
     }
+
+    // Parse remaining named params.
+    let (input, (ov_named, offset_named, tier_named, fascia_named, sec_named)) =
+        parse_roof_named_params(input)?;
+
+    // Named params override positional.
+    if let Some(v) = ov_named {
+        if v < 0.0 {
+            return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+        }
+        overhang = v;
+    }
+    if let Some(v) = sec_named {
+        secondary_pitch = Some(v);
+    }
+
     let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+
+    let config = RoofConfig {
+        roof_type,
+        pitch,
+        secondary_pitch,
+        overhang,
+        ridge_offset: offset_named.unwrap_or(0.5),
+        fascia_depth: fascia_named.unwrap_or(0.0),
+        tier_height: tier_named,
+    };
+
     let (input, _) = cut(ws(c_char('{'))).parse(input)?;
     let (mut remaining, first) = cut(ws(parse_roof_case)).parse(input)?;
     let mut cases = vec![first];
@@ -489,15 +596,67 @@ fn parse_roof(input: &str) -> IResult<&str, ShapeOp> {
         }
     }
     let (remaining, _) = ws(c_char('}')).parse(remaining)?;
-    Ok((
-        remaining,
-        ShapeOp::Roof {
-            roof_type,
-            angle,
-            overhang,
-            cases,
-        },
-    ))
+    Ok((remaining, ShapeOp::Roof { config, cases }))
+}
+
+/// Parses a single `Attach` case: `Surface: Rule` or `All: Rule`.
+fn parse_attach_case(input: &str) -> IResult<&str, AttachCase> {
+    let (input, sel_str) = ws(identifier).parse(input)?;
+    let selector = AttachSelector::parse(sel_str)
+        .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Tag)))?;
+    let (input, _) = ws(c_char(':')).parse(input)?;
+    let (input, rule) = ws(rule_name).parse(input)?;
+    Ok((input, AttachCase { selector, rule }))
+}
+
+/// Named world-direction targets shared with `Align`.
+fn parse_world_axis(input: &str) -> IResult<&str, Vec3> {
+    let (input, name) = ws(identifier).parse(input)?;
+    let v = match name {
+        "Up" | "up" => Vec3::Y,
+        "Down" | "down" => Vec3::NEG_Y,
+        "Right" | "right" => Vec3::X,
+        "Left" | "left" => Vec3::NEG_X,
+        "Forward" | "forward" => Vec3::NEG_Z,
+        "Back" | "back" => Vec3::Z,
+        _ => return Err(nom::Err::Failure(Error::new(input, ErrorKind::Tag))),
+    };
+    Ok((input, v))
+}
+
+/// `Attach(Up) { Surface: DormerMass }`
+fn parse_attach(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("Attach").parse(input)?;
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, world_axis) = cut(ws(parse_world_axis)).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
+    let (mut remaining, first) = cut(ws(parse_attach_case)).parse(input)?;
+    let mut cases = vec![first];
+    loop {
+        if cases.len() >= MAX_COMP_CASES {
+            return Err(nom::Err::Failure(Error::new(
+                remaining,
+                ErrorKind::TooLarge,
+            )));
+        }
+        let Ok((after_sep, _)) = ws::<_, _, Error<&str>>(c_char('|')).parse(remaining) else {
+            break;
+        };
+        match ws(parse_attach_case).parse(after_sep) {
+            Ok((after_item, case)) => {
+                cases.push(case);
+                remaining = after_item;
+            }
+            Err(nom::Err::Failure(e)) => return Err(nom::Err::Failure(e)),
+            Err(_) => {
+                remaining = after_sep;
+                break;
+            }
+        }
+    }
+    let (remaining, _) = ws(c_char('}')).parse(remaining)?;
+    Ok((remaining, ShapeOp::Attach { world_axis, cases }))
 }
 
 fn parse_rule_ref(input: &str) -> IResult<&str, ShapeOp> {
@@ -522,6 +681,7 @@ fn parse_op(input: &str) -> IResult<&str, ShapeOp> {
         parse_align,
         parse_offset,
         parse_roof,
+        parse_attach,
         parse_rule_ref,
     ))
     .parse(input)
@@ -542,6 +702,7 @@ fn is_terminating_op(op: &ShapeOp) -> bool {
             | ShapeOp::Repeat { .. }
             | ShapeOp::Offset { .. }
             | ShapeOp::Roof { .. }
+            | ShapeOp::Attach { .. }
     )
 }
 
@@ -1087,18 +1248,12 @@ mod tests {
     fn test_parse_roof_gable_no_overhang() {
         let ops = parse_ops("Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }").unwrap();
         assert_eq!(ops.len(), 1);
-        let ShapeOp::Roof {
-            roof_type,
-            angle,
-            overhang,
-            cases,
-        } = &ops[0]
-        else {
+        let ShapeOp::Roof { config, cases } = &ops[0] else {
             panic!("expected Roof");
         };
-        assert_eq!(*roof_type, RoofType::Gable);
-        assert!((*angle - 30.0).abs() < 1e-9);
-        assert!((*overhang).abs() < 1e-9);
+        assert_eq!(config.roof_type, RoofType::Gable);
+        assert!((config.pitch - 30.0).abs() < 1e-9);
+        assert!(config.overhang.abs() < 1e-9);
         assert_eq!(cases.len(), 2);
         assert_eq!(cases[0].selector, RoofFaceSelector::Slope);
         assert_eq!(cases[1].selector, RoofFaceSelector::GableEnd);
@@ -1107,18 +1262,12 @@ mod tests {
     #[test]
     fn test_parse_roof_hip_with_overhang() {
         let ops = parse_ops("Roof(Hip, 45, 0.5) { Slope: Tiles }").unwrap();
-        let ShapeOp::Roof {
-            roof_type,
-            angle,
-            overhang,
-            ..
-        } = &ops[0]
-        else {
+        let ShapeOp::Roof { config, .. } = &ops[0] else {
             panic!("expected Roof");
         };
-        assert_eq!(*roof_type, RoofType::Hip);
-        assert!((*angle - 45.0).abs() < 1e-9);
-        assert!((*overhang - 0.5).abs() < 1e-9);
+        assert_eq!(config.roof_type, RoofType::Hip);
+        assert!((config.pitch - 45.0).abs() < 1e-9);
+        assert!((config.overhang - 0.5).abs() < 1e-9);
     }
 
     #[test]

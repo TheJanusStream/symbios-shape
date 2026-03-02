@@ -1,7 +1,8 @@
 use symbios_shape::grammar::parse_ops;
+use symbios_shape::model::FaceProfile;
 use symbios_shape::ops::{
     Axis, CompFaceCase, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase,
-    RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
+    RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
 };
 use symbios_shape::{Interpreter, Quat, Scope, ShapeError, Vec3};
 
@@ -92,7 +93,7 @@ fn taper_propagates_to_terminal() {
         vec![ShapeOp::Taper(0.6), ShapeOp::I("Cone".to_string())],
     );
     let model = interp.derive(unit_scope(), "R").unwrap();
-    assert!((model.terminals[0].taper - 0.6).abs() < 1e-9);
+    assert!(matches!(model.terminals[0].face_profile, FaceProfile::Taper(t) if (t - 0.6).abs() < 1e-9));
 }
 
 #[test]
@@ -100,7 +101,7 @@ fn no_taper_defaults_to_zero() {
     let mut interp = Interpreter::new();
     interp.add_rule("R", vec![ShapeOp::I("Box".to_string())]);
     let model = interp.derive(unit_scope(), "R").unwrap();
-    assert_eq!(model.terminals[0].taper, 0.0);
+    assert_eq!(model.terminals[0].face_profile, FaceProfile::Rectangle);
 }
 
 // ── Scale ─────────────────────────────────────────────────────────────────────
@@ -418,7 +419,7 @@ fn parse_and_derive_building() {
     assert_eq!(model.terminals[0].mesh_id, "GroundFloor");
     assert!((model.terminals[0].scope.size.y - 3.0).abs() < 1e-9);
     assert_eq!(model.terminals[2].mesh_id, "Roof");
-    assert!((model.terminals[2].taper - 0.8).abs() < 1e-9);
+    assert!(matches!(model.terminals[2].face_profile, FaceProfile::Taper(t) if (t - 0.8).abs() < 1e-9));
 }
 
 // ── Infinity / NaN propagation guards ────────────────────────────────────────
@@ -472,9 +473,7 @@ fn roof_trig_overflow_large_scope_rejected() {
     interp.add_rule(
         "R",
         vec![ShapeOp::Roof {
-            roof_type: RoofType::Gable,
-            angle: 89.0,
-            overhang: 0.0,
+            config: RoofConfig::new(RoofType::Gable, 89.0),
             cases: vec![RoofCase {
                 selector: RoofFaceSelector::Slope,
                 rule: "Tiles".to_string(),
@@ -496,9 +495,11 @@ fn roof_large_overhang_overflow_rejected() {
     interp.add_rule(
         "R",
         vec![ShapeOp::Roof {
-            roof_type: RoofType::Pyramid,
-            angle: 45.0,
-            overhang: f64::MAX * 0.9,
+            config: {
+                let mut c = RoofConfig::new(RoofType::Pyramid, 45.0);
+                c.overhang = f64::MAX * 0.9;
+                c
+            },
             cases: vec![RoofCase {
                 selector: RoofFaceSelector::Slope,
                 rule: "Tiles".to_string(),

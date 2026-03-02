@@ -195,11 +195,9 @@ fn mutate_op<R: Rng>(op: &mut ShapeOp, rng: &mut R, rate: f32) {
         ShapeOp::Repeat { tile_size, .. } => {
             *tile_size = jitter(rng, rate, *tile_size, 0.3).max(0.1);
         }
-        ShapeOp::Roof {
-            angle, overhang, ..
-        } => {
-            *angle = jitter(rng, rate, *angle, 5.0).clamp(1.0, 89.0);
-            *overhang = jitter(rng, rate, *overhang, 0.2).clamp(0.0, 2.0);
+        ShapeOp::Roof { config, .. } => {
+            config.pitch = jitter(rng, rate, config.pitch, 5.0).clamp(1.0, 89.0);
+            config.overhang = jitter(rng, rate, config.overhang, 0.2).clamp(0.0, 2.0);
         }
         // Non-parametric ops have no float to jitter.
         ShapeOp::Rotate(_)
@@ -208,7 +206,8 @@ fn mutate_op<R: Rng>(op: &mut ShapeOp, rng: &mut R, rate: f32) {
         | ShapeOp::I(_)
         | ShapeOp::Mat(_)
         | ShapeOp::Rule(_)
-        | ShapeOp::Align { .. } => {}
+        | ShapeOp::Align { .. }
+        | ShapeOp::Attach { .. } => {}
     }
 }
 
@@ -271,6 +270,7 @@ fn same_op_kind(a: &ShapeOp, b: &ShapeOp) -> bool {
             | (Align { .. }, Align { .. })
             | (Offset { .. }, Offset { .. })
             | (Roof { .. }, Roof { .. })
+            | (Attach { .. }, Attach { .. })
     )
 }
 
@@ -345,24 +345,12 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             tile_size: blx(*tsa, *tsb, 0.5, rng).max(0.1),
             rule: rule.clone(),
         },
-        (
-            ShapeOp::Roof {
-                roof_type,
-                angle: aa,
-                overhang: oa,
-                cases,
-            },
-            ShapeOp::Roof {
-                angle: ab,
-                overhang: ob,
-                ..
-            },
-        ) => ShapeOp::Roof {
-            roof_type: *roof_type,
-            angle: blx(*aa, *ab, 0.5, rng).clamp(1.0, 89.0),
-            overhang: blx(*oa, *ob, 0.5, rng).clamp(0.0, 2.0),
-            cases: cases.clone(),
-        },
+        (ShapeOp::Roof { config: ca, cases }, ShapeOp::Roof { config: cb, .. }) => {
+            let mut config = ca.clone();
+            config.pitch = blx(ca.pitch, cb.pitch, 0.5, rng).clamp(1.0, 89.0);
+            config.overhang = blx(ca.overhang, cb.overhang, 0.5, rng).clamp(0.0, 2.0);
+            ShapeOp::Roof { config, cases: cases.clone() }
+        }
         // Non-parametric or unblendable: use parent A unchanged.
         _ => a.clone(),
     }

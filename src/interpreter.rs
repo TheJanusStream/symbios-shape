@@ -14,10 +14,10 @@ use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ShapeError;
-use crate::model::{ShapeModel, Terminal};
+use crate::model::{taper_to_profile, FaceProfile, ShapeModel, Terminal};
 use crate::ops::{
-    Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector, RoofCase, RoofFaceSelector,
-    RoofType, ShapeOp, SplitSize, SplitSlot,
+    AttachCase, AttachSelector, Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector,
+    RoofCase, RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
 };
 use crate::scope::{Quat, Scope, Vec3};
 
@@ -46,6 +46,9 @@ struct WorkItem {
     /// to the terminal. Branching ops (Split/Comp/Repeat) reset it to 0.0 for
     /// children — taper is not accumulated across rule boundaries.
     taper: f64,
+    /// Explicit face profile set by `Roof` panel generation; overrides `taper`
+    /// when computing the terminal's `face_profile`.
+    face_profile_override: Option<FaceProfile>,
     /// Material identifier set by `Mat("...")` ops; propagates to child scopes.
     material: Option<String>,
 }
@@ -288,6 +291,21 @@ fn find_roof_rule(selector: RoofFaceSelector, cases: &[RoofCase]) -> Option<&str
     None
 }
 
+/// Rule look-up for `Attach` cases.
+fn find_attach_rule(selector: AttachSelector, cases: &[AttachCase]) -> Option<&str> {
+    for c in cases {
+        if c.selector == selector {
+            return Some(&c.rule);
+        }
+    }
+    for c in cases {
+        if c.selector == AttachSelector::All {
+            return Some(&c.rule);
+        }
+    }
+    None
+}
+
 /// Rotations for the four cardinal slope directions used by `Roof`.
 ///
 /// All rotations are expressed as deltas in the **parent scope's local frame**
@@ -317,6 +335,478 @@ fn roof_slope_rotations(alpha: f64) -> (Quat, Quat, Quat, Quat) {
     let right_rot = Quat::from_axis_angle(Vec3::Z, FRAC_PI_2 - alpha)
         * Quat::from_axis_angle(Vec3::Y, FRAC_PI_2);
     (front_rot, back_rot, left_rot, right_rot)
+}
+
+// ── Roof geometry ─────────────────────────────────────────────────────────────
+
+/// Generates roof panel scopes for all supported `RoofType` variants.
+///
+/// Each panel is a flat scope (size.z = 0) with an orientation that places
+/// local Z along the outward normal and local Y up the slope, consistent with
+/// the `Comp(Faces)` convention. The `face_profile_override` field on each
+/// child `WorkItem` carries the exact 2D cross-section shape.
+#[allow(clippy::too_many_arguments)]
+fn apply_roof(
+    config: &RoofConfig,
+    cases: &[RoofCase],
+    scope: &Scope,
+    depth: usize,
+    material: &Option<String>,
+    queue: &mut VecDeque<WorkItem>,
+    model: &mut ShapeModel,
+    max_terminals: usize,
+) -> Result<(), ShapeError> {
+    if !config.pitch.is_finite() || config.pitch <= 0.0 || config.pitch >= 90.0 {
+        return Err(ShapeError::InvalidRoofAngle(config.pitch));
+    }
+    if !config.overhang.is_finite() || config.overhang < 0.0 {
+        return Err(ShapeError::InvalidNumericValue);
+    }
+
+    let sx = scope.size.x;
+    let sz = scope.size.z;
+    let o = config.overhang;
+    let alpha = config.pitch.to_radians();
+    let cos_a = alpha.cos();
+    let tan_a = alpha.tan();
+    let (front_rot, back_rot, left_rot, right_rot) = roof_slope_rotations(alpha);
+    // y_anchor: Y offset below scope.position due to eave overhang projection.
+    let y_anchor = -o * tan_a;
+    // Slope lengths from eave to ridge centre (including overhang).
+    let fb_len = (sz / 2.0 + o) / cos_a;
+    let lr_len = (sx / 2.0 + o) / cos_a;
+    // Ridge height above eave (driven by depth, no overhang contribution to height).
+    let h = (sz / 2.0) * tan_a;
+
+    if !fb_len.is_finite() || !lr_len.is_finite() || !h.is_finite() {
+        return Err(ShapeError::InvalidNumericValue);
+    }
+
+    // Panel tuple: (local_offset, face_size, rot_delta, selector, face_profile)
+    type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, FaceProfile);
+
+    let panels: Vec<Panel> = match config.roof_type {
+        // ── Flat ─────────────────────────────────────────────────────────────
+        // One horizontal panel covering the scope top (same geometry as Comp Top).
+        RoofType::Flat => vec![(
+            Vec3::new(0.0, 0.0, sz),
+            Vec3::new(sx, sz, 0.0),
+            Quat::from_axis_angle(Vec3::X, -FRAC_PI_2),
+            RoofFaceSelector::Slope,
+            FaceProfile::Rectangle,
+        )],
+
+        // ── Shed ─────────────────────────────────────────────────────────────
+        // One slope from front eave to back eave (front_rot convention).
+        RoofType::Shed => vec![(
+            Vec3::new(sx + o, y_anchor, -o),
+            Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
+            front_rot,
+            RoofFaceSelector::Slope,
+            FaceProfile::Rectangle,
+        )],
+
+        // ── Pyramid / PyramidHip ──────────────────────────────────────────────
+        // Four triangular slopes meeting at a single apex.
+        RoofType::Pyramid | RoofType::PyramidHip => vec![
+            (
+                Vec3::new(sx + o, y_anchor, -o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                front_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Triangle { peak_offset: 0.5 },
+            ),
+            (
+                Vec3::new(-o, y_anchor, sz + o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                back_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Triangle { peak_offset: 0.5 },
+            ),
+            (
+                Vec3::new(-o, y_anchor, -o),
+                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
+                left_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Triangle { peak_offset: 0.5 },
+            ),
+            (
+                Vec3::new(sx + o, y_anchor, sz + o),
+                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
+                right_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Triangle { peak_offset: 0.5 },
+            ),
+        ],
+
+        // ── Gable ─────────────────────────────────────────────────────────────
+        // Two rectangular slopes + two triangular gable-end verticals.
+        RoofType::Gable => vec![
+            (
+                Vec3::new(sx + o, y_anchor, -o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                front_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Rectangle,
+            ),
+            (
+                Vec3::new(-o, y_anchor, sz + o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                back_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Rectangle,
+            ),
+            (
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(sz, h, 0.0),
+                Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
+                RoofFaceSelector::GableEnd,
+                FaceProfile::Triangle { peak_offset: 0.5 },
+            ),
+            (
+                Vec3::new(sx, 0.0, sz),
+                Vec3::new(sz, h, 0.0),
+                Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
+                RoofFaceSelector::GableEnd,
+                FaceProfile::Triangle { peak_offset: 0.5 },
+            ),
+        ],
+
+        // ── OpenGable ─────────────────────────────────────────────────────────
+        // Two rectangular slopes only — no gable-end panels.
+        RoofType::OpenGable => vec![
+            (
+                Vec3::new(sx + o, y_anchor, -o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                front_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Rectangle,
+            ),
+            (
+                Vec3::new(-o, y_anchor, sz + o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                back_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Rectangle,
+            ),
+        ],
+
+        // ── BoxGable ──────────────────────────────────────────────────────────
+        // Two slopes + two rectangular (non-tapered) gable-end panels.
+        RoofType::BoxGable => vec![
+            (
+                Vec3::new(sx + o, y_anchor, -o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                front_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Rectangle,
+            ),
+            (
+                Vec3::new(-o, y_anchor, sz + o),
+                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
+                back_rot,
+                RoofFaceSelector::Slope,
+                FaceProfile::Rectangle,
+            ),
+            (
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(sz, h, 0.0),
+                Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
+                RoofFaceSelector::GableEnd,
+                FaceProfile::Rectangle,
+            ),
+            (
+                Vec3::new(sx, 0.0, sz),
+                Vec3::new(sz, h, 0.0),
+                Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
+                RoofFaceSelector::GableEnd,
+                FaceProfile::Rectangle,
+            ),
+        ],
+
+        // ── Hip ───────────────────────────────────────────────────────────────
+        // Front/back: trapezoidal; left/right end: triangular (when sx > sz).
+        RoofType::Hip => {
+            let eave_w = sx + 2.0 * o;
+            // The end-slope horizontal run in X = sz/2 (equal pitch assumption).
+            let (fb_profile, end_profile) = if sx > sz {
+                let top_w = (sx - sz) / eave_w;
+                let off_x = (sz / 2.0) / eave_w;
+                (
+                    FaceProfile::Trapezoid { top_width: top_w, offset_x: off_x },
+                    FaceProfile::Triangle { peak_offset: 0.5 },
+                )
+            } else {
+                (
+                    FaceProfile::Triangle { peak_offset: 0.5 },
+                    FaceProfile::Triangle { peak_offset: 0.5 },
+                )
+            };
+            vec![
+                (Vec3::new(sx + o, y_anchor, -o), Vec3::new(eave_w, fb_len, 0.0), front_rot, RoofFaceSelector::Slope, fb_profile.clone()),
+                (Vec3::new(-o, y_anchor, sz + o), Vec3::new(eave_w, fb_len, 0.0), back_rot, RoofFaceSelector::Slope, fb_profile),
+                (Vec3::new(-o, y_anchor, -o), Vec3::new(sz + 2.0 * o, lr_len, 0.0), left_rot, RoofFaceSelector::Slope, end_profile.clone()),
+                (Vec3::new(sx + o, y_anchor, sz + o), Vec3::new(sz + 2.0 * o, lr_len, 0.0), right_rot, RoofFaceSelector::Slope, end_profile),
+            ]
+        }
+
+        // ── Butterfly ─────────────────────────────────────────────────────────
+        // Two inward-tilting slopes with a valley at centre (z = sz/2).
+        // Panels run FROM the valley TOWARD each eave using back_rot/front_rot.
+        RoofType::Butterfly => {
+            // The valley sits (sz/2 + o)*tan_a below eave level.
+            let y_valley = y_anchor - (sz / 2.0 + o) * tan_a;
+            if !y_valley.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            vec![
+                // Front valley slope: valley → front eave (back_rot points toward -Z = front)
+                (Vec3::new(-o, y_valley, sz / 2.0), Vec3::new(sx + 2.0 * o, fb_len, 0.0), back_rot, RoofFaceSelector::ValleySlope, FaceProfile::Rectangle),
+                // Back valley slope: valley → back eave (front_rot points toward +Z = back)
+                (Vec3::new(sx + o, y_valley, sz / 2.0), Vec3::new(sx + 2.0 * o, fb_len, 0.0), front_rot, RoofFaceSelector::ValleySlope, FaceProfile::Rectangle),
+            ]
+        }
+
+        // ── MShaped ───────────────────────────────────────────────────────────
+        // Two ridges (at z = sz/4 and z = 3*sz/4) with a valley at z = sz/2.
+        // Four slopes: outer-front, inner-front (valley), inner-back (valley), outer-back.
+        RoofType::MShaped => {
+            let quarter = sz / 4.0;
+            let h_m = quarter * tan_a;
+            if !h_m.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let slope_m = quarter / cos_a;
+            let y_valley = y_anchor - h_m; // valley is h_m below the outer ridges
+            vec![
+                // Outer front: eave (z=-o) → front ridge (z=sz/4)
+                (Vec3::new(sx + o, y_anchor, -o), Vec3::new(sx + 2.0 * o, slope_m, 0.0), front_rot, RoofFaceSelector::OuterSlope, FaceProfile::Rectangle),
+                // Inner front: valley (z=sz/2) → front ridge (z=sz/4), using back_rot
+                (Vec3::new(-o, y_valley, sz / 2.0), Vec3::new(sx + 2.0 * o, slope_m, 0.0), back_rot, RoofFaceSelector::InnerSlope, FaceProfile::Rectangle),
+                // Inner back: valley (z=sz/2) → back ridge (z=3*sz/4), using front_rot
+                (Vec3::new(sx + o, y_valley, sz / 2.0), Vec3::new(sx + 2.0 * o, slope_m, 0.0), front_rot, RoofFaceSelector::InnerSlope, FaceProfile::Rectangle),
+                // Outer back: eave (z=sz+o) → back ridge (z=3*sz/4)
+                (Vec3::new(-o, y_anchor, sz + o), Vec3::new(sx + 2.0 * o, slope_m, 0.0), back_rot, RoofFaceSelector::OuterSlope, FaceProfile::Rectangle),
+            ]
+        }
+
+        // ── Gambrel ───────────────────────────────────────────────────────────
+        // Two-pitch front/back barn roof: steep lower zone + shallow upper zone.
+        RoofType::Gambrel => {
+            let alpha2 = config.secondary_pitch_or_default().to_radians();
+            if !alpha2.is_finite() || alpha2 <= 0.0 || alpha2 >= FRAC_PI_2 {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let cos_a2 = alpha2.cos();
+            let tan_a2 = alpha2.tan();
+            let tier = config.tier_height_or(0.5).clamp(0.01, 0.99);
+            let tier_z = tier * sz / 2.0;
+            // Height at pitch break above eave.
+            let h_break = (tier_z + o) * tan_a;
+            if !h_break.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let lower_slope = (tier_z + o) / cos_a;
+            let upper_slope = (sz / 2.0 - tier_z) / cos_a2;
+            if !lower_slope.is_finite() || !upper_slope.is_finite() || !tan_a2.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let (upper_front_rot, upper_back_rot, _, _) = roof_slope_rotations(alpha2);
+            let y_break = y_anchor + h_break;
+            vec![
+                // Lower steep slopes
+                (Vec3::new(sx + o, y_anchor, -o), Vec3::new(sx + 2.0 * o, lower_slope, 0.0), front_rot, RoofFaceSelector::LowerSlope, FaceProfile::Rectangle),
+                (Vec3::new(-o, y_anchor, sz + o), Vec3::new(sx + 2.0 * o, lower_slope, 0.0), back_rot, RoofFaceSelector::LowerSlope, FaceProfile::Rectangle),
+                // Upper shallow slopes — origin at pitch-break in scope-local coords.
+                // front lower slope travels (tier_z+o) in +Z and h_break in +Y from origin;
+                // back lower slope travels (tier_z+o) in −Z and h_break in +Y from its origin.
+                (Vec3::new(sx + o, y_break, tier_z), Vec3::new(sx + 2.0 * o, upper_slope, 0.0), upper_front_rot, RoofFaceSelector::UpperSlope, FaceProfile::Rectangle),
+                (Vec3::new(-o, y_break, sz - tier_z), Vec3::new(sx + 2.0 * o, upper_slope, 0.0), upper_back_rot, RoofFaceSelector::UpperSlope, FaceProfile::Rectangle),
+            ]
+        }
+
+        // ── Mansard ───────────────────────────────────────────────────────────
+        // Gambrel applied to all four sides: 4 steep lower + 4 shallow upper panels.
+        RoofType::Mansard => {
+            let alpha2 = config.secondary_pitch_or_default().to_radians();
+            if !alpha2.is_finite() || alpha2 <= 0.0 || alpha2 >= FRAC_PI_2 {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let cos_a2 = alpha2.cos();
+            let tier = config.tier_height_or(0.5).clamp(0.01, 0.99);
+            // Pitch-break distances in Z (front/back) and X (left/right).
+            let tier_z = tier * sz / 2.0;
+            let tier_x = tier * sx / 2.0;
+            let h_break_z = (tier_z + o) * tan_a;
+            let h_break_x = (tier_x + o) * tan_a;
+            if !h_break_z.is_finite() || !h_break_x.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let lower_fb = (tier_z + o) / cos_a;
+            let lower_lr = (tier_x + o) / cos_a;
+            let upper_fb = (sz / 2.0 - tier_z) / cos_a2;
+            let upper_lr = (sx / 2.0 - tier_x) / cos_a2;
+            if !lower_fb.is_finite() || !lower_lr.is_finite()
+                || !upper_fb.is_finite() || !upper_lr.is_finite()
+            {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let (ufr, ubr, ulr, urr) = roof_slope_rotations(alpha2);
+            let y_break_z = y_anchor + h_break_z;
+            let y_break_x = y_anchor + h_break_x;
+            vec![
+                // Lower front/back (steep)
+                (Vec3::new(sx + o, y_anchor, -o),      Vec3::new(sx + 2.0*o, lower_fb, 0.0), front_rot, RoofFaceSelector::LowerSlope, FaceProfile::Rectangle),
+                (Vec3::new(-o, y_anchor, sz + o),      Vec3::new(sx + 2.0*o, lower_fb, 0.0), back_rot,  RoofFaceSelector::LowerSlope, FaceProfile::Rectangle),
+                // Lower left/right (steep)
+                (Vec3::new(-o,    y_anchor, -o),        Vec3::new(sz + 2.0*o, lower_lr, 0.0), left_rot,  RoofFaceSelector::LowerSlope, FaceProfile::Rectangle),
+                (Vec3::new(sx+o, y_anchor, sz + o),    Vec3::new(sz + 2.0*o, lower_lr, 0.0), right_rot, RoofFaceSelector::LowerSlope, FaceProfile::Rectangle),
+                // Upper front/back (shallow) — origins at pitch-break points
+                (Vec3::new(sx + o, y_break_z, tier_z),      Vec3::new(sx + 2.0*o, upper_fb, 0.0), ufr, RoofFaceSelector::UpperSlope, FaceProfile::Rectangle),
+                (Vec3::new(-o,    y_break_z, sz - tier_z),   Vec3::new(sx + 2.0*o, upper_fb, 0.0), ubr, RoofFaceSelector::UpperSlope, FaceProfile::Rectangle),
+                // Upper left/right (shallow) — left slope local_Y = (+cos_a, +sin_a, 0)
+                // so pitch break is at scope-local (tier_x, y_break_x, -o); right at (sx-tier_x, y_break_x, sz+o)
+                (Vec3::new(tier_x,      y_break_x, -o),     Vec3::new(sz + 2.0*o, upper_lr, 0.0), ulr, RoofFaceSelector::UpperSlope, FaceProfile::Rectangle),
+                (Vec3::new(sx-tier_x, y_break_x, sz + o),  Vec3::new(sz + 2.0*o, upper_lr, 0.0), urr, RoofFaceSelector::UpperSlope, FaceProfile::Rectangle),
+            ]
+        }
+
+        // ── Saltbox ───────────────────────────────────────────────────────────
+        // Asymmetric Gable: ridge offset from front by `ridge_offset` fraction of sz.
+        // Front slope is steeper (pitch = alpha); back slope angle derived from h and depth.
+        RoofType::Saltbox => {
+            let ridge_z = sz * config.ridge_offset;
+            if !ridge_z.is_finite() || ridge_z <= 0.0 || ridge_z >= sz {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let h_s = ridge_z * tan_a;
+            let back_depth = sz - ridge_z;
+            let alpha_back = ((h_s) / (back_depth + o)).atan();
+            let cos_ab = alpha_back.cos();
+            if !h_s.is_finite() || !alpha_back.is_finite() || cos_ab < 1e-9 {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let front_len = (ridge_z + o) / cos_a;
+            let back_len = (back_depth + o) / cos_ab;
+            if !front_len.is_finite() || !back_len.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let (_, back_rot_s, _, _) = roof_slope_rotations(alpha_back);
+            // Gable end peak normalized offset: ridge_z / sz from left edge.
+            let peak_fwd = ridge_z / sz;
+            vec![
+                (Vec3::new(sx + o, y_anchor, -o),  Vec3::new(sx + 2.0*o, front_len, 0.0), front_rot,  RoofFaceSelector::Slope,    FaceProfile::Rectangle),
+                (Vec3::new(-o, y_anchor, sz + o),   Vec3::new(sx + 2.0*o, back_len,  0.0), back_rot_s, RoofFaceSelector::Slope,    FaceProfile::Rectangle),
+                (Vec3::new(0.0, 0.0, 0.0),           Vec3::new(sz, h_s, 0.0), Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2), RoofFaceSelector::GableEnd, FaceProfile::Triangle { peak_offset: peak_fwd }),
+                (Vec3::new(sx, 0.0, sz),             Vec3::new(sz, h_s, 0.0), Quat::from_axis_angle(Vec3::Y,  FRAC_PI_2), RoofFaceSelector::GableEnd, FaceProfile::Triangle { peak_offset: 1.0 - peak_fwd }),
+            ]
+        }
+
+        // ── Jerkinhead ────────────────────────────────────────────────────────
+        // Gable with clipped-hip corners: main slopes are Trapezoid; small HipEnd triangles
+        // fill the clipped gable-end corners.
+        RoofType::Jerkinhead => {
+            let tier = config.tier_height_or(0.25).clamp(0.0, 1.0);
+            // Height of the clipped zone (measured from ridge downward along slope).
+            let clip_h = tier * h;
+            // Horizontal run in X consumed by each hip-end triangle.
+            let clip_run = if tan_a > 1e-9 { clip_h / tan_a } else { 0.0 };
+            if !clip_h.is_finite() || !clip_run.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            let top_w_abs = (sx + 2.0 * o) - 2.0 * clip_run;
+            let eave_w = sx + 2.0 * o;
+            let (slope_profile, hip_profile) = if top_w_abs > 1e-9 {
+                let tw = top_w_abs / eave_w;
+                let ox = clip_run / eave_w;
+                (FaceProfile::Trapezoid { top_width: tw, offset_x: ox }, FaceProfile::Triangle { peak_offset: 0.5 })
+            } else {
+                (FaceProfile::Triangle { peak_offset: 0.5 }, FaceProfile::Triangle { peak_offset: 0.5 })
+            };
+            // Hip-end slope length: height clip_h / sin(alpha) (approximate).
+            let hip_len = if alpha.sin() > 1e-9 { clip_h / alpha.sin() } else { lr_len };
+            vec![
+                (Vec3::new(sx + o, y_anchor, -o),    Vec3::new(eave_w, fb_len, 0.0), front_rot, RoofFaceSelector::Slope,  slope_profile.clone()),
+                (Vec3::new(-o, y_anchor, sz + o),     Vec3::new(eave_w, fb_len, 0.0), back_rot,  RoofFaceSelector::Slope,  slope_profile),
+                (Vec3::new(-o, y_anchor, -o),          Vec3::new(sz + 2.0*o, hip_len, 0.0), left_rot,  RoofFaceSelector::HipEnd, hip_profile.clone()),
+                (Vec3::new(sx + o, y_anchor, sz + o), Vec3::new(sz + 2.0*o, hip_len, 0.0), right_rot, RoofFaceSelector::HipEnd, hip_profile),
+            ]
+        }
+
+        // ── DutchGable ────────────────────────────────────────────────────────
+        // Hip roof with a small gable rising from the ridge centre.
+        // `tier_height` controls the fraction of slope height used for the lower Hip portion.
+        RoofType::DutchGable => {
+            let tier = config.tier_height_or(0.7).clamp(0.01, 0.99);
+            // Lower Hip portion: goes from eave to tier*h height.
+            let lower_fb = tier * fb_len;
+            let lower_lr = tier * lr_len;
+            // Horizontal run consumed by end slopes at the tier height.
+            let end_run = tier * h / tan_a.max(1e-9);
+            if !lower_fb.is_finite() || !lower_lr.is_finite() || !end_run.is_finite() {
+                return Err(ShapeError::InvalidNumericValue);
+            }
+            // Front/back Hip slope profile at tier height.
+            let top_w_abs = (sx + 2.0 * o) - 2.0 * end_run;
+            let eave_w = sx + 2.0 * o;
+            let (lower_fb_profile, end_profile) = if top_w_abs > 1e-9 {
+                let tw = top_w_abs / eave_w;
+                let ox = end_run / eave_w;
+                (FaceProfile::Trapezoid { top_width: tw, offset_x: ox }, FaceProfile::Triangle { peak_offset: 0.5 })
+            } else {
+                (FaceProfile::Triangle { peak_offset: 0.5 }, FaceProfile::Triangle { peak_offset: 0.5 })
+            };
+            // Upper gable portion: small Gable slopes above tier height.
+            let y_gable = y_anchor + tier * h;
+            let upper_fb = (1.0 - tier) * fb_len;
+            let upper_h = (1.0 - tier) * h;
+            let gable_w = top_w_abs.max(1e-3);
+            vec![
+                // Lower Hip front/back
+                (Vec3::new(sx + o, y_anchor, -o),      Vec3::new(eave_w, lower_fb, 0.0), front_rot, RoofFaceSelector::Slope,    lower_fb_profile.clone()),
+                (Vec3::new(-o, y_anchor, sz + o),      Vec3::new(eave_w, lower_fb, 0.0), back_rot,  RoofFaceSelector::Slope,    lower_fb_profile),
+                // Lower Hip left/right
+                (Vec3::new(-o, y_anchor, -o),           Vec3::new(sz + 2.0*o, lower_lr, 0.0), left_rot,  RoofFaceSelector::Slope, end_profile.clone()),
+                (Vec3::new(sx + o, y_anchor, sz + o),  Vec3::new(sz + 2.0*o, lower_lr, 0.0), right_rot, RoofFaceSelector::Slope, end_profile),
+                // Upper Gable front/back (small, positioned at tier break)
+                (Vec3::new(sx + o, y_gable, sz / 2.0 - (sz / 2.0 * (1.0 - tier))), Vec3::new(gable_w, upper_fb, 0.0), front_rot, RoofFaceSelector::Slope, FaceProfile::Rectangle),
+                (Vec3::new(-o, y_gable, sz / 2.0 + (sz / 2.0 * (1.0 - tier))), Vec3::new(gable_w, upper_fb, 0.0), back_rot, RoofFaceSelector::Slope, FaceProfile::Rectangle),
+                // Small gable ends
+                (Vec3::new(end_run, y_gable, end_run),           Vec3::new(gable_w, upper_h, 0.0), Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2), RoofFaceSelector::GableEnd, FaceProfile::Triangle { peak_offset: 0.5 }),
+                (Vec3::new(sx - end_run, y_gable, sz - end_run), Vec3::new(gable_w, upper_h, 0.0), Quat::from_axis_angle(Vec3::Y,  FRAC_PI_2), RoofFaceSelector::GableEnd, FaceProfile::Triangle { peak_offset: 0.5 }),
+            ]
+        }
+    };
+
+    if queue.len() + panels.len() > MAX_QUEUE {
+        return Err(ShapeError::CapacityOverflow);
+    }
+    for (local_off, face_size, rot_delta, selector, profile) in panels {
+        let Some(rule) = find_roof_rule(selector, cases) else {
+            continue;
+        };
+        // Skip degenerate panels (zero-area).
+        if face_size.x < 1e-9 || face_size.y < 1e-9 {
+            continue;
+        }
+        let face_pos = scope.position + scope.rotation * local_off;
+        let face_rot = (scope.rotation * rot_delta).normalize();
+        let face_scope = Scope::new(face_pos, face_rot, face_size);
+        face_scope.validate()?;
+        if model.len() + queue.len() >= max_terminals {
+            return Err(ShapeError::CapacityOverflow);
+        }
+        queue.push_back(WorkItem {
+            scope: face_scope,
+            rule: rule.to_string(),
+            depth: depth + 1,
+            taper: 0.0,
+            face_profile_override: Some(profile),
+            material: material.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 // ── Stochastic selection ──────────────────────────────────────────────────────
@@ -444,6 +934,7 @@ impl Interpreter {
             rule: root_rule.into(),
             depth: 0,
             taper: 0.0,
+            face_profile_override: None,
             material: None,
         });
 
@@ -462,10 +953,12 @@ impl Interpreter {
                     if model.len() >= self.max_terminals {
                         return Err(ShapeError::CapacityOverflow);
                     }
-                    model.push(Terminal::new_full(
+                    let profile = item.face_profile_override
+                        .unwrap_or_else(|| taper_to_profile(item.taper));
+                    model.push(Terminal::new_profiled(
                         item.scope,
                         &item.rule,
-                        item.taper,
+                        profile,
                         item.material,
                     ));
                     continue;
@@ -475,6 +968,7 @@ impl Interpreter {
             self.apply_ops(
                 item.scope,
                 item.taper,
+                item.face_profile_override,
                 item.material,
                 ops,
                 item.depth,
@@ -496,6 +990,7 @@ impl Interpreter {
         &self,
         initial_scope: Scope,
         initial_taper: f64,
+        initial_face_profile: Option<FaceProfile>,
         initial_material: Option<String>,
         ops: &[ShapeOp],
         depth: usize,
@@ -504,6 +999,7 @@ impl Interpreter {
     ) -> Result<(), ShapeError> {
         let mut scope = initial_scope;
         let mut taper = initial_taper;
+        let mut face_profile = initial_face_profile;
         let mut material = initial_material;
 
         for op in ops {
@@ -649,6 +1145,7 @@ impl Interpreter {
                             rule: rule.to_string(),
                             depth: depth + 1,
                             taper: 0.0,
+                            face_profile_override: None,
                             material: material.clone(),
                         });
                     }
@@ -678,6 +1175,7 @@ impl Interpreter {
                                 rule: rule.to_string(),
                                 depth: depth + 1,
                                 taper: 0.0,
+                                face_profile_override: None,
                                 material: material.clone(),
                             });
                         }
@@ -686,163 +1184,37 @@ impl Interpreter {
                 }
 
                 // ── Branching: Roof ───────────────────────────────────────
-                ShapeOp::Roof {
-                    roof_type,
-                    angle,
-                    overhang,
-                    cases,
-                } => {
-                    if !angle.is_finite() || *angle <= 0.0 || *angle >= 90.0 {
-                        return Err(ShapeError::InvalidRoofAngle(*angle));
-                    }
-                    if !overhang.is_finite() || *overhang < 0.0 {
-                        return Err(ShapeError::InvalidNumericValue);
-                    }
-                    let sx = scope.size.x;
-                    let _sy = scope.size.y;
-                    let sz = scope.size.z;
-                    let o = *overhang;
-                    let alpha = angle.to_radians();
-                    let cos_a = alpha.cos();
-                    let (front_rot, back_rot, left_rot, right_rot) = roof_slope_rotations(alpha);
-                    let y_anchor = -o * alpha.tan();
+                ShapeOp::Roof { config, cases } => {
+                    apply_roof(
+                        config, cases, &scope, depth, &material, queue, model,
+                        self.max_terminals,
+                    )?;
+                    return Ok(());
+                }
 
-                    // slope_lengths: (fb = front/back depth, lr = left/right depth)
-                    let fb_len = (sz / 2.0 + o) / cos_a;
-                    let lr_len = (sx / 2.0 + o) / cos_a;
-                    // Large scope sizes or near-90° angles can overflow cos_a (≈0)
-                    // division to INFINITY. Catch before baking into child scopes.
-                    if !fb_len.is_finite() || !lr_len.is_finite() {
-                        return Err(ShapeError::InvalidNumericValue);
+                // ── Branching: Attach ─────────────────────────────────────
+                ShapeOp::Attach { world_axis, cases } => {
+                    let len_sq = world_axis.length_squared();
+                    if !world_axis.is_finite() || !len_sq.is_finite() || len_sq < 1e-12 {
+                        return Err(ShapeError::InvalidAlignTarget);
                     }
-
-                    // Each panel: (local_offset, face_size, rot_delta, selector, taper)
-                    type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, f64);
-                    let panels: Vec<Panel> = match roof_type {
-                        RoofType::Shed => vec![(
-                            Vec3::new(sx + o, y_anchor, -o),
-                            Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
-                            front_rot,
-                            RoofFaceSelector::Slope,
-                            0.0,
-                        )],
-                        RoofType::Pyramid => vec![
-                            (
-                                Vec3::new(sx + o, y_anchor, -o),
-                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
-                                front_rot,
-                                RoofFaceSelector::Slope,
-                                1.0,
-                            ),
-                            (
-                                Vec3::new(-o, y_anchor, sz + o),
-                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
-                                back_rot,
-                                RoofFaceSelector::Slope,
-                                1.0,
-                            ),
-                            (
-                                Vec3::new(-o, y_anchor, -o),
-                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
-                                left_rot,
-                                RoofFaceSelector::Slope,
-                                1.0,
-                            ),
-                            (
-                                Vec3::new(sx + o, y_anchor, sz + o),
-                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
-                                right_rot,
-                                RoofFaceSelector::Slope,
-                                1.0,
-                            ),
-                        ],
-                        RoofType::Gable => {
-                            let h = (sz / 2.0) * alpha.tan();
-                            // Near-90° angles cause tan() to overflow to INFINITY.
-                            if !h.is_finite() {
-                                return Err(ShapeError::InvalidNumericValue);
-                            }
-                            vec![
-                                // Two slope panels
-                                (
-                                    Vec3::new(sx + o, y_anchor, -o),
-                                    Vec3::new(sx + 2.0 * o, fb_len, 0.0),
-                                    front_rot,
-                                    RoofFaceSelector::Slope,
-                                    0.0,
-                                ),
-                                (
-                                    Vec3::new(-o, y_anchor, sz + o),
-                                    Vec3::new(sx + 2.0 * o, fb_len, 0.0),
-                                    back_rot,
-                                    RoofFaceSelector::Slope,
-                                    0.0,
-                                ),
-                                // Two vertical gable-end rectangles (same orientation as Left/Right Comp faces)
-                                (
-                                    Vec3::new(0.0, 0.0, 0.0),
-                                    Vec3::new(sz, h, 0.0),
-                                    Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
-                                    RoofFaceSelector::GableEnd,
-                                    1.0,
-                                ),
-                                (
-                                    Vec3::new(sx, 0.0, sz),
-                                    Vec3::new(sz, h, 0.0),
-                                    Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
-                                    RoofFaceSelector::GableEnd,
-                                    1.0,
-                                ),
-                            ]
+                    let axis_norm = world_axis.normalize();
+                    // Build a new scope whose Y axis = world_axis.
+                    // The new scope sits at the same corner as the current scope,
+                    // has X = scope.size.x, Y = scope.size.y, Z = 0 (flat surface).
+                    let rot = Quat::from_rotation_arc(Vec3::Y, axis_norm);
+                    let attach_scope = Scope::new(scope.position, rot.normalize(), Vec3::new(scope.size.x, scope.size.y, 0.0));
+                    attach_scope.validate()?;
+                    if let Some(rule) = find_attach_rule(crate::ops::AttachSelector::Surface, cases) {
+                        if queue.len() >= MAX_QUEUE {
+                            return Err(ShapeError::CapacityOverflow);
                         }
-                        RoofType::Hip => vec![
-                            (
-                                Vec3::new(sx + o, y_anchor, -o),
-                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
-                                front_rot,
-                                RoofFaceSelector::Slope,
-                                0.0,
-                            ),
-                            (
-                                Vec3::new(-o, y_anchor, sz + o),
-                                Vec3::new(sx + 2.0 * o, fb_len, 0.0),
-                                back_rot,
-                                RoofFaceSelector::Slope,
-                                0.0,
-                            ),
-                            (
-                                Vec3::new(-o, y_anchor, -o),
-                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
-                                left_rot,
-                                RoofFaceSelector::Slope,
-                                1.0,
-                            ),
-                            (
-                                Vec3::new(sx + o, y_anchor, sz + o),
-                                Vec3::new(sz + 2.0 * o, lr_len, 0.0),
-                                right_rot,
-                                RoofFaceSelector::Slope,
-                                1.0,
-                            ),
-                        ],
-                    };
-
-                    if queue.len() + panels.len() > MAX_QUEUE {
-                        return Err(ShapeError::CapacityOverflow);
-                    }
-                    for (local_off, face_size, rot_delta, selector, panel_taper) in panels {
-                        let Some(rule) = find_roof_rule(selector, cases) else {
-                            continue;
-                        };
-                        let face_pos = scope.position + scope.rotation * local_off;
-                        let face_rot = (scope.rotation * rot_delta).normalize();
-                        let face_scope = Scope::new(face_pos, face_rot, face_size);
-                        face_scope.validate()?;
                         queue.push_back(WorkItem {
-                            scope: face_scope,
+                            scope: attach_scope,
                             rule: rule.to_string(),
                             depth: depth + 1,
-                            taper: panel_taper,
+                            taper: 0.0,
+                            face_profile_override: None,
                             material: material.clone(),
                         });
                     }
@@ -869,6 +1241,7 @@ impl Interpreter {
                             rule: slot.rule.clone(),
                             depth: depth + 1,
                             taper: 0.0,
+                            face_profile_override: None,
                             material: material.clone(),
                         });
                         offset += size;
@@ -924,6 +1297,7 @@ impl Interpreter {
                                 rule: rule.clone(),
                                 depth: depth + 1,
                                 taper: 0.0,
+                                face_profile_override: None,
                                 material: material.clone(),
                             });
                         }
@@ -955,6 +1329,7 @@ impl Interpreter {
                             rule: rule.to_string(),
                             depth: depth + 1,
                             taper: 0.0,
+                            face_profile_override: None,
                             material: material.clone(),
                         });
                     }
@@ -966,7 +1341,10 @@ impl Interpreter {
                     if model.len() >= self.max_terminals {
                         return Err(ShapeError::CapacityOverflow);
                     }
-                    model.push(Terminal::new_full(scope, mesh_id, taper, material));
+                    let profile = face_profile
+                        .take()
+                        .unwrap_or_else(|| taper_to_profile(taper));
+                    model.push(Terminal::new_profiled(scope, mesh_id, profile, material));
                     return Ok(());
                 }
 
@@ -977,6 +1355,7 @@ impl Interpreter {
                         rule: name.clone(),
                         depth: depth + 1,
                         taper,
+                        face_profile_override: face_profile,
                         material,
                     });
                     return Ok(());
@@ -1663,9 +2042,7 @@ mod tests {
         interp.add_rule(
             "R",
             vec![ShapeOp::Roof {
-                roof_type: RoofType::Shed,
-                angle: 30.0,
-                overhang: 0.0,
+                config: RoofConfig::new(RoofType::Shed, 30.0),
                 cases: vec![crate::ops::RoofCase {
                     selector: RoofFaceSelector::Slope,
                     rule: "Tiles".to_string(),
@@ -1686,9 +2063,7 @@ mod tests {
         interp.add_rule(
             "R",
             vec![ShapeOp::Roof {
-                roof_type: RoofType::Gable,
-                angle: 30.0,
-                overhang: 0.0,
+                config: RoofConfig::new(RoofType::Gable, 30.0),
                 cases: vec![
                     crate::ops::RoofCase {
                         selector: RoofFaceSelector::Slope,
@@ -1725,9 +2100,11 @@ mod tests {
         interp.add_rule(
             "R",
             vec![ShapeOp::Roof {
-                roof_type: RoofType::Hip,
-                angle: 45.0,
-                overhang: 0.3,
+                config: {
+                    let mut c = RoofConfig::new(RoofType::Hip, 45.0);
+                    c.overhang = 0.3;
+                    c
+                },
                 cases: vec![crate::ops::RoofCase {
                     selector: RoofFaceSelector::Slope,
                     rule: "Tiles".to_string(),
@@ -1745,9 +2122,7 @@ mod tests {
         interp.add_rule(
             "R",
             vec![ShapeOp::Roof {
-                roof_type: RoofType::Pyramid,
-                angle: 40.0,
-                overhang: 0.0,
+                config: RoofConfig::new(RoofType::Pyramid, 40.0),
                 cases: vec![crate::ops::RoofCase {
                     selector: RoofFaceSelector::Slope,
                     rule: "Tiles".to_string(),
@@ -1757,12 +2132,12 @@ mod tests {
         let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(6.0, 3.0, 6.0));
         let model = interp.derive(scope, "R").unwrap();
         assert_eq!(model.len(), 4);
-        // All pyramid panels carry taper=1.0
+        // All pyramid panels carry Triangle face profile
         for t in &model.terminals {
             assert!(
-                (t.taper - 1.0).abs() < 1e-9,
-                "expected taper=1.0, got {}",
-                t.taper
+                matches!(t.face_profile, FaceProfile::Triangle { peak_offset } if (peak_offset - 0.5).abs() < 1e-9),
+                "expected Triangle{{peak_offset=0.5}}, got {:?}",
+                t.face_profile
             );
         }
     }
@@ -1780,9 +2155,7 @@ mod tests {
         interp.add_rule(
             "R",
             vec![ShapeOp::Roof {
-                roof_type: RoofType::Hip,
-                angle: 30.0,
-                overhang: 0.0,
+                config: RoofConfig::new(RoofType::Hip, 30.0),
                 cases: vec![crate::ops::RoofCase {
                     selector: RoofFaceSelector::Slope,
                     rule: "S".to_string(),
@@ -1857,9 +2230,7 @@ mod tests {
         interp.add_rule(
             "R",
             vec![ShapeOp::Roof {
-                roof_type: RoofType::Shed,
-                angle: 0.0,
-                overhang: 0.0,
+                config: RoofConfig::new(RoofType::Shed, 0.0),
                 cases: vec![],
             }],
         );

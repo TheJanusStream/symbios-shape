@@ -119,6 +119,7 @@ pub struct OffsetCase {
 /// Roof shape types for the `Roof` operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoofType {
+    // ── Original types ────────────────────────────────────────────────────────
     /// Four triangular slope panels meeting at a single apex.
     Pyramid,
     /// Single slope panel from front eave to back eave.
@@ -127,6 +128,36 @@ pub enum RoofType {
     Gable,
     /// Four trapezoidal slope panels meeting at a horizontal ridge.
     Hip,
+
+    // ── New types ─────────────────────────────────────────────────────────────
+    /// Flat horizontal roof — a single horizontal panel covering the scope top.
+    Flat,
+    /// Two rectangular slope panels only (Gable without the triangular end panels).
+    OpenGable,
+    /// Two slope panels + two rectangular (non-tapered) gable-end wall panels.
+    BoxGable,
+    /// Four panels from a rectangular base meeting at a single apex point (no ridge).
+    /// Equivalent to `Pyramid` for square footprints; left/right end panels are triangular.
+    PyramidHip,
+    /// Two inward-tilting slopes forming a central valley (inverted Gable).
+    Butterfly,
+    /// Four panels forming two parallel ridges with a central valley between them (M profile).
+    MShaped,
+    /// Two pitches per slope: steeper lower zone + shallower upper zone (barn roof).
+    /// Requires `secondary_pitch` in `RoofConfig`.
+    Gambrel,
+    /// Gambrel applied to all four sides: 4 steep lower panels + 4 shallow upper panels.
+    /// Requires `secondary_pitch` in `RoofConfig`.
+    Mansard,
+    /// Asymmetric Gable: the ridge is offset toward one end (`ridge_offset` in `RoofConfig`).
+    /// Front slope is steeper; back slope is shallower. Gable ends are asymmetric triangles.
+    Saltbox,
+    /// Gable with clipped hip ends: the upper corners of each gable end are replaced by
+    /// small triangular hip panels. Controlled by `tier_height` in `RoofConfig`.
+    Jerkinhead,
+    /// Hip roof with a small gable rising from the ridge centre.
+    /// Controlled by `tier_height` (fraction of slope from base where the gable starts).
+    DutchGable,
 }
 
 impl RoofType {
@@ -136,6 +167,17 @@ impl RoofType {
             "shed" | "Shed" => Some(Self::Shed),
             "gable" | "Gable" => Some(Self::Gable),
             "hip" | "Hip" => Some(Self::Hip),
+            "flat" | "Flat" => Some(Self::Flat),
+            "openGable" | "OpenGable" => Some(Self::OpenGable),
+            "boxGable" | "BoxGable" => Some(Self::BoxGable),
+            "pyramidHip" | "PyramidHip" => Some(Self::PyramidHip),
+            "butterfly" | "Butterfly" => Some(Self::Butterfly),
+            "mShaped" | "MShaped" => Some(Self::MShaped),
+            "gambrel" | "Gambrel" => Some(Self::Gambrel),
+            "mansard" | "Mansard" => Some(Self::Mansard),
+            "saltbox" | "Saltbox" => Some(Self::Saltbox),
+            "jerkinhead" | "Jerkinhead" => Some(Self::Jerkinhead),
+            "dutchGable" | "DutchGable" => Some(Self::DutchGable),
             _ => None,
         }
     }
@@ -144,10 +186,22 @@ impl RoofType {
 /// Face selectors for the `Roof` operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RoofFaceSelector {
-    /// The sloped panel(s).
+    /// The main sloped panel(s) — front/back in most roof types.
     Slope,
-    /// The triangular vertical end panels of a Gable roof.
+    /// The triangular vertical end panels of a Gable or Saltbox roof.
     GableEnd,
+    /// The steeper, lower zone of a Gambrel or Mansard roof.
+    LowerSlope,
+    /// The shallower, upper zone of a Gambrel or Mansard roof.
+    UpperSlope,
+    /// The small triangular hip panels at the clipped ends of a Jerkinhead roof.
+    HipEnd,
+    /// The inward-facing slopes of a Butterfly or MShaped valley.
+    ValleySlope,
+    /// The outer slopes of an MShaped roof (facing away from the valley).
+    OuterSlope,
+    /// The inner slopes of an MShaped roof (facing toward the valley).
+    InnerSlope,
     /// Matches any selector not otherwise mapped.
     All,
 }
@@ -157,6 +211,12 @@ impl RoofFaceSelector {
         match s {
             "slope" | "Slope" => Some(Self::Slope),
             "gable" | "GableEnd" | "gableEnd" => Some(Self::GableEnd),
+            "lowerSlope" | "LowerSlope" => Some(Self::LowerSlope),
+            "upperSlope" | "UpperSlope" => Some(Self::UpperSlope),
+            "hipEnd" | "HipEnd" => Some(Self::HipEnd),
+            "valleySlope" | "ValleySlope" => Some(Self::ValleySlope),
+            "outerSlope" | "OuterSlope" => Some(Self::OuterSlope),
+            "innerSlope" | "InnerSlope" => Some(Self::InnerSlope),
             "all" | "All" | "_" => Some(Self::All),
             _ => None,
         }
@@ -167,6 +227,82 @@ impl RoofFaceSelector {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoofCase {
     pub selector: RoofFaceSelector,
+    pub rule: String,
+}
+
+/// Rich parametric configuration for the `Roof` operation.
+///
+/// All angular values are in degrees. Lengths are in world units.
+/// Optional fields default as described; see each field doc.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoofConfig {
+    pub roof_type: RoofType,
+    /// Primary pitch angle in degrees from horizontal. Must be in (0°, 90°).
+    pub pitch: f64,
+    /// Secondary pitch angle in degrees. Used by `Gambrel` (upper zone) and `Mansard`.
+    /// If `None` when required, defaults to `pitch / 2`.
+    pub secondary_pitch: Option<f64>,
+    /// Extra overhang beyond the scope footprint on each side. Default `0.0`.
+    pub overhang: f64,
+    /// Ridge offset for `Saltbox`: fraction [0, 1] of the scope depth (Z) where the
+    /// ridge is positioned from the front. Default `0.5` (symmetric / centred ridge).
+    pub ridge_offset: f64,
+    /// Thickness of the roof fascia edge in world units. Default `0.0` (flat panels).
+    pub fascia_depth: f64,
+    /// Normalised height at which the pitch break occurs for `Gambrel`, `Mansard`,
+    /// `Jerkinhead`, and `DutchGable`. `0.5` means the break is at half the eave-to-ridge
+    /// distance. `None` uses a type-specific default.
+    pub tier_height: Option<f64>,
+}
+
+impl RoofConfig {
+    /// Creates a minimal config for deterministic types (Pyramid, Shed, Gable, Hip, Flat, …).
+    pub fn new(roof_type: RoofType, pitch: f64) -> Self {
+        Self {
+            roof_type,
+            pitch,
+            secondary_pitch: None,
+            overhang: 0.0,
+            ridge_offset: 0.5,
+            fascia_depth: 0.0,
+            tier_height: None,
+        }
+    }
+
+    /// Returns the secondary pitch, defaulting to `pitch / 2` if unset.
+    pub fn secondary_pitch_or_default(&self) -> f64 {
+        self.secondary_pitch.unwrap_or(self.pitch / 2.0)
+    }
+
+    /// Returns the tier height, defaulting to `default` if unset.
+    pub fn tier_height_or(&self, default: f64) -> f64 {
+        self.tier_height.unwrap_or(default)
+    }
+}
+
+/// Selector for the `Attach` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AttachSelector {
+    /// The projected scope that sits on (or comes out of) the surface.
+    Surface,
+    /// Matches any selector not otherwise mapped.
+    All,
+}
+
+impl AttachSelector {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "surface" | "Surface" => Some(Self::Surface),
+            "all" | "All" | "_" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// A single mapping in an `Attach` block: a selector → rule name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachCase {
+    pub selector: AttachSelector,
     pub rule: String,
 }
 
@@ -242,18 +378,31 @@ pub enum ShapeOp {
         cases: Vec<OffsetCase>,
     },
 
-    /// Generates a roof structure above the current scope.
+    /// Generates a roof structure above the current scope using rich parametric configuration.
     ///
-    /// Operates on a volume scope; the `angle` is the pitch measured in degrees from
-    /// horizontal. `overhang` is the extra distance the roof extends beyond the scope
-    /// footprint on each side.
+    /// Operates on a volume scope. The `config` contains the roof type, primary pitch angle,
+    /// optional secondary pitch, overhang, ridge offset, fascia depth, and tier height.
     ///
-    /// Syntax: `Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }`
-    /// Syntax: `Roof(Hip, 30, 0.5) { Slope: Tiles }`
+    /// Syntax examples:
+    /// - `Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }` — basic Gable
+    /// - `Roof(Hip, 30, 0.5) { Slope: Tiles }` — Hip with overhang
+    /// - `Roof(Gambrel, 45, 20) { LowerSlope: Shingles | UpperSlope: Tiles }` — Gambrel
+    /// - `Roof(Saltbox, 45, offset=0.3) { Slope: Tiles | GableEnd: Bricks }` — Saltbox
+    /// - `Roof(DutchGable, 45, tier=0.7) { Slope: Tiles | GableEnd: Bricks }` — Dutch Gable
     Roof {
-        roof_type: RoofType,
-        angle: f64,
-        overhang: f64,
+        config: RoofConfig,
         cases: Vec<RoofCase>,
+    },
+
+    /// Projects a new horizontal scope out of a sloped face for attaching dormers or details.
+    ///
+    /// `world_axis` defines the "up" direction for the attached scope (usually world Y).
+    /// The resulting scope sits on the face's surface with its Y axis aligned to `world_axis`,
+    /// inheriting the face's width and height but with depth = 0.
+    ///
+    /// Syntax: `Attach(Up) { Surface: DormerMass }`
+    Attach {
+        world_axis: Vec3,
+        cases: Vec<AttachCase>,
     },
 }

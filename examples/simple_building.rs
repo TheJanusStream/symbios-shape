@@ -66,8 +66,8 @@ fn main() {
             s.size.y,
             s.size.z,
         );
-        if terminal.taper > 0.0 {
-            print!("  taper={:.2}", terminal.taper);
+        if !matches!(terminal.face_profile, symbios_shape::model::FaceProfile::Rectangle) {
+            print!("  profile={:?}", terminal.face_profile);
         }
         println!();
     }
@@ -104,8 +104,8 @@ fn main() {
     assert_eq!(window_nodes.len(), 12, "expected 6 windows × 2 floors");
     assert_eq!(roof_nodes.len(), 1, "expected 1 roof");
     assert!(
-        (roof_nodes[0].taper - 0.75).abs() < 1e-9,
-        "roof taper should be 0.75"
+        matches!(roof_nodes[0].face_profile, symbios_shape::model::FaceProfile::Taper(t) if (t - 0.75).abs() < 1e-9),
+        "roof face_profile should be Taper(0.75)"
     );
 
     println!();
