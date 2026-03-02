@@ -398,13 +398,32 @@ fn apply_roof(
 
         // ── Shed ─────────────────────────────────────────────────────────────
         // One slope from front eave to back eave (front_rot convention).
-        RoofType::Shed => vec![(
-            Vec3::new(sx + o, y_anchor, -o),
-            Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
-            front_rot,
-            RoofFaceSelector::Slope,
-            FaceProfile::Rectangle,
-        )],
+        RoofType::Shed => {
+            let shed_h = sz * tan_a;
+            vec![
+                (
+                    Vec3::new(sx + o, y_anchor, -o),
+                    Vec3::new(sx + 2.0 * o, (sz + 2.0 * o) / cos_a, 0.0),
+                    front_rot,
+                    RoofFaceSelector::Slope,
+                    FaceProfile::Rectangle,
+                ),
+                (
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(sz, shed_h, 0.0),
+                    Quat::from_axis_angle(Vec3::Y, -FRAC_PI_2),
+                    RoofFaceSelector::GableEnd,
+                    FaceProfile::Triangle { peak_offset: 1.0 },
+                ),
+                (
+                    Vec3::new(sx, 0.0, sz),
+                    Vec3::new(sz, shed_h, 0.0),
+                    Quat::from_axis_angle(Vec3::Y, FRAC_PI_2),
+                    RoofFaceSelector::GableEnd,
+                    FaceProfile::Triangle { peak_offset: 0.0 },
+                ),
+            ]
+        }
 
         // ── Pyramid / PyramidHip ──────────────────────────────────────────────
         // Four triangular slopes meeting at a single apex.
@@ -664,7 +683,7 @@ fn apply_roof(
             let tier = config.tier_height_or(0.5).clamp(0.01, 0.99);
 
             let run_z = sz / 2.0 + o;
-            let break_run = tier * run_z;
+            let break_run = (tier * run_z).clamp(o, run_z - 1e-3);
             let h_break = break_run * tan_a;
 
             if !h_break.is_finite() {
@@ -767,7 +786,8 @@ fn apply_roof(
             let cos_a2 = alpha2.cos();
             let tier = config.tier_height_or(0.5).clamp(0.01, 0.99);
 
-            let break_run = tier * (sx.min(sz) / 2.0 + o);
+            let max_run = sx.min(sz) / 2.0 + o;
+            let break_run = (tier * max_run).clamp(o, max_run - 1e-3);
             let h_break = break_run * tan_a;
 
             if !h_break.is_finite() {
@@ -954,8 +974,8 @@ fn apply_roof(
         RoofType::Jerkinhead => {
             let tier = config.tier_height_or(0.25).clamp(0.01, 0.99);
 
-            let run_z = sz / 2.0;
-            let clip_run = tier * run_z;
+            let max_clip = (sx / 2.0 + o).min(sz / 2.0);
+            let clip_run = (tier * sz / 2.0).clamp(0.0, max_clip - 1e-3);
 
             let eave_w = sx + 2.0 * o;
             let top_w = (eave_w - 2.0 * clip_run).max(0.0);
@@ -969,7 +989,7 @@ fn apply_roof(
                 FaceProfile::Triangle { peak_offset: 0.5 }
             };
 
-            let wall_h = (1.0 - tier) * h;
+            let wall_h = (h - clip_run * tan_a).max(0.0);
             let wall_profile = if clip_run > 1e-9 {
                 FaceProfile::Trapezoid {
                     top_width: (2.0 * clip_run) / sz,
@@ -1038,8 +1058,8 @@ fn apply_roof(
         RoofType::DutchGable => {
             let tier = config.tier_height_or(0.7).clamp(0.01, 0.99);
 
-            let run_z = sz / 2.0 + o;
-            let break_run = tier * run_z;
+            let max_run = sx.min(sz) / 2.0 + o;
+            let break_run = (tier * max_run).clamp(o, max_run - 1e-3);
 
             if !break_run.is_finite() {
                 return Err(ShapeError::InvalidNumericValue);
@@ -1072,7 +1092,7 @@ fn apply_roof(
                 FaceProfile::Triangle { peak_offset: 0.5 }
             };
 
-            let upper_run = run_z - break_run;
+            let upper_run = (sz / 2.0 + o) - break_run;
             let upper_slope_len = upper_run / cos_a;
             let upper_h = upper_run * tan_a;
 
