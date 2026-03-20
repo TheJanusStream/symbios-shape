@@ -458,6 +458,7 @@ fn parse_named_float<'a>(key: &'static str, input: &'a str) -> IResult<&'a str, 
 
 /// Parses named parameters for Roof in any order: `overhang=N`, `offset=N`, `tier=N`, `fascia=N`, `secondary=N`.
 /// Each is preceded by a comma that must already be consumed by the caller before each attempt.
+#[allow(clippy::type_complexity)]
 fn parse_roof_named_params(
     input: &str,
 ) -> IResult<
