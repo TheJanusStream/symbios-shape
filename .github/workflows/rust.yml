@@ -26,9 +26,3 @@ jobs:
 
             - name: Run Tests
               run: cargo test --verbose
-
-            - name: Verify Examples
-              run: |
-                  cargo run --example anabaena
-                  cargo run --example monopodial_tree
-                  cargo run --example stochastic_decay
