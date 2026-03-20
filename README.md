@@ -13,7 +13,9 @@ Roof  --> Taper(0.75) I("RoofMesh")
 ## Features
 
 - **All core CGA ops** — `Extrude`, `Split`, `Repeat`, `Comp(Faces)`, `Taper`,
-  `Scale`, `Translate`, `Rotate`, `I`, `Mat`
+  `Scale`, `Translate`, `Rotate`, `Align`, `Offset`, `Roof`, `Attach`, `I`, `Mat`
+- **15 roof types** — Pyramid, Shed, Gable, Hip, Flat, OpenGable, BoxGable,
+  PyramidHip, Butterfly, MShaped, Gambrel, Mansard, Saltbox, Jerkinhead, DutchGable
 - **Three split modes** — absolute (`3:`), relative (`'0.3:`), floating (`~1:`)
 - **Stochastic rules** — `70% BrickFacade | 30% GlassFacade` with reproducible
   seeded RNG
@@ -21,8 +23,13 @@ Roof  --> Taper(0.75) I("RoofMesh")
   an explicit `I(...)` op
 - **Material propagation** — `Mat("Brick")` stamps a material that flows through
   all branching ops to the final `Terminal`
-- **Lightweight** — depends only on `glam` (math), `nom` (parsing), and `rand`
-  (stochastic rules); no engine or runtime required
+- **Rich face profiles** — `FaceProfile` describes each terminal's cross-section
+  (Rectangle, Taper, Triangle, Trapezoid, Polygon) for accurate mesh generation
+- **Genetic evolution** — `ShapeGenotype` wraps the rule table for use with
+  `symbios-genetics` algorithms (mutation, BLX-α crossover)
+- **Lightweight** — depends only on `glam` (math), `nom` (parsing), `rand`
+  (stochastic rules), and optionally `symbios-genetics`; no engine or runtime
+  required
 - **DoS-hardened** — bounded queue, depth, terminal, and identifier limits
 
 ## Installation
@@ -66,9 +73,13 @@ for t in &model.terminals {
 | Scale | `Scale(x, y, z)` | Multiply scope size (all > 0) |
 | Translate | `Translate(x, y, z)` | Shift origin in local space |
 | Rotate | `Rotate(w, x, y, z)` | Apply quaternion rotation |
+| Align | `Align(Y, Up)` | Rotate so local axis points at world direction |
 | Split | `Split(Y) { 3: A \| ~1: B \| '0.2: C }` | Divide along axis |
 | Repeat | `Repeat(X, 2.5) { Window }` | Tile along axis, stretch to fill |
 | Comp | `Comp(Faces) { Top: R \| Side: R \| Bottom: R }` | Decompose into face scopes |
+| Offset | `Offset(-0.2) { Inside: R \| Border: R }` | Inset a 2D face scope |
+| Roof | `Roof(Gable, 30) { Slope: R \| GableEnd: R }` | Generate roof geometry |
+| Attach | `Attach(Up) { Surface: R }` | Project a scope onto a sloped face |
 | I | `I("MeshId")` or `I(MeshId)` | Emit terminal |
 | Mat | `Mat("Brick")` or `Mat(Brick)` | Set material (propagates to terminal) |
 | Rule ref | `RuleName` | Delegate to another rule |
@@ -98,8 +109,63 @@ Facade --> 70% BrickWall | 30% GlassCurtain
 ### Comp Face Selectors
 
 `Top`, `Bottom`, `Front`, `Back`, `Left`, `Right`, `Side` (all four sides),
-`All` (catch-all). Each face scope is oriented so local **Z** points along the
-outward normal.
+`All` or `_` (catch-all). Each face scope is oriented so local **Z** points
+along the outward normal.
+
+### Align
+
+Rotates the scope so that a local axis points in a world direction (shortest-arc
+rotation). Named targets: `Up`, `Down`, `Right`, `Left`, `Forward`, `Back`.
+
+```text
+Align(Y, Up)         # local Y → world up
+Align(Z, Forward)    # local Z → world forward (0,0,-1)
+```
+
+### Offset
+
+Insets a 2D face scope, producing an `Inside` rectangle and four `Border`
+strips. The distance must be negative (inset). Rejects if the inset exceeds
+half the scope dimension.
+
+```text
+Offset(-0.2) { Inside: Glass | Border: Frame }
+```
+
+Selectors: `Inside`, `Border`, `All`.
+
+### Roof
+
+Generates roof geometry above a volume scope. Supports 15 roof types with
+configurable pitch, overhang, secondary pitch, ridge offset, fascia depth, and
+tier height.
+
+```text
+Roof(Gable, 30) { Slope: Tiles | GableEnd: Bricks }
+Roof(Hip, 30, 0.5) { Slope: Tiles }
+Roof(Gambrel, 45, 20) { LowerSlope: Shingles | UpperSlope: Tiles }
+Roof(Saltbox, 45, offset=0.3) { Slope: Tiles | GableEnd: Bricks }
+Roof(DutchGable, 45, tier=0.7) { Slope: Tiles | GableEnd: Bricks }
+```
+
+Roof types: `Pyramid`, `Shed`, `Gable`, `Hip`, `Flat`, `OpenGable`, `BoxGable`,
+`PyramidHip`, `Butterfly`, `MShaped`, `Gambrel`, `Mansard`, `Saltbox`,
+`Jerkinhead`, `DutchGable`.
+
+Face selectors: `Slope`, `GableEnd`, `LowerSlope`, `UpperSlope`, `HipEnd`,
+`ValleySlope`, `OuterSlope`, `InnerSlope`, `All`.
+
+### Attach
+
+Projects a new horizontal scope onto a sloped face for attaching dormers or
+surface details. The resulting scope sits on the face with its Y axis aligned to
+the specified world direction.
+
+```text
+Attach(Up) { Surface: DormerMass }
+```
+
+Selectors: `Surface`, `All`.
 
 ## Rust API
 
@@ -126,12 +192,22 @@ interp.seed = 42; // reproducible derivation
 
 ```rust
 pub struct Terminal {
-    pub scope: Scope,       // position, rotation, size (OBB)
-    pub mesh_id: String,    // asset to spawn
-    pub taper: f64,         // 0 = box, 1 = pyramid
+    pub scope: Scope,                // position, rotation, size (OBB)
+    pub mesh_id: String,             // asset to spawn
+    pub face_profile: FaceProfile,   // cross-section shape (Rectangle, Taper, Triangle, …)
     pub material: Option<String>,
 }
 ```
+
+`FaceProfile` describes each terminal's 2D cross-section for mesh generation:
+
+| Variant | Description |
+|---------|-------------|
+| `Rectangle` | Full rectangular face (default) |
+| `Taper(t)` | Legacy tapered prism (0 = box, 1 = pyramid) |
+| `Triangle { peak_offset }` | Triangular face (0.5 = symmetric gable) |
+| `Trapezoid { top_width, offset_x }` | Trapezoidal face (hip roof slopes) |
+| `Polygon(Vec<DVec2>)` | Arbitrary polygon (straight skeleton output) |
 
 ## Safety Limits
 
@@ -150,6 +226,27 @@ The engine enforces hard caps to prevent runaway grammars:
 
 Exceeding a limit returns `Err(ShapeError::CapacityOverflow)` or
 `Err(ShapeError::DepthLimitExceeded)` rather than panicking.
+
+## Genetic Evolution
+
+The `genetics` module provides `ShapeGenotype`, a wrapper around the rule table
+that implements `symbios_genetics::Genotype`. Plug it into any
+`symbios-genetics` algorithm (SimpleGA, NSGA-II, MAP-Elites) to evolve
+procedural building grammars.
+
+```rust
+use symbios_shape::genetics::ShapeGenotype;
+use symbios_genetics::Genotype;
+use rand::SeedableRng;
+use rand_pcg::Pcg64;
+
+let dna = ShapeGenotype::from_interpreter(&interp);
+let mut rng = Pcg64::seed_from_u64(42);
+
+let mut child = dna.clone();
+child.mutate(&mut rng, 0.3);           // Gaussian jitter on parametric floats
+let offspring = dna.crossover(&child, &mut rng);  // BLX-α blending
+```
 
 ## Architecture
 

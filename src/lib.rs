@@ -9,10 +9,13 @@
 //!
 //! ## Key Features
 //!
-//! - **Lightweight**: Depends only on `glam` (math), `nom` (parsing), and `rand` (stochastic rules) — no engine or runtime required.
-//! - **CGA-Compatible Operations**: `Extrude`, `Split`, `Comp`, `Repeat`, `I`, and more.
+//! - **Lightweight**: Depends only on `glam` (math), `nom` (parsing), `rand` (stochastic rules), and optionally `symbios-genetics` — no engine or runtime required.
+//! - **CGA-Compatible Operations**: `Extrude`, `Split`, `Comp`, `Repeat`, `Taper`, `Scale`, `Translate`, `Rotate`, `Align`, `Offset`, `Roof`, `Attach`, `I`, `Mat`.
+//! - **15 Roof Types**: Pyramid, Shed, Gable, Hip, Flat, OpenGable, BoxGable, PyramidHip, Butterfly, MShaped, Gambrel, Mansard, Saltbox, Jerkinhead, DutchGable.
 //! - **Flexible Split Sizing**: Absolute, relative (`'`), and floating (`~`) modes.
-//! - **Bevy-Ready Output**: `ShapeModel` containing `Terminal` nodes (scope + mesh_id).
+//! - **Rich Face Profiles**: `FaceProfile` describes each terminal's cross-section (Rectangle, Taper, Triangle, Trapezoid, Polygon).
+//! - **Genetic Evolution**: `ShapeGenotype` wraps the rule table for `symbios-genetics` algorithms.
+//! - **Bevy-Ready Output**: `ShapeModel` containing `Terminal` nodes with scope, mesh_id, face_profile, and material.
 //!
 //! ## Example
 //!
