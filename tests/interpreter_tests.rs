@@ -160,6 +160,7 @@ fn split_y_positions_are_sequential() {
                 slot(SplitSize::Absolute(4.0), "B"),
                 slot(SplitSize::Absolute(3.0), "C"),
             ],
+            snap: None,
         }],
     );
     let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 10.0, 10.0));
@@ -185,6 +186,7 @@ fn split_floating_fills_remainder() {
                 slot(SplitSize::Floating(3.0), "Mid"),
                 slot(SplitSize::Floating(1.0), "Top"),
             ],
+            snap: None,
         }],
     );
     let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 10.0, 10.0));
@@ -207,6 +209,7 @@ fn split_x_widths_correct() {
                 slot(SplitSize::Floating(1.0), "L"),
                 slot(SplitSize::Floating(1.0), "R"),
             ],
+            snap: None,
         }],
     );
     let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(6.0, 4.0, 4.0));

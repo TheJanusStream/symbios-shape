@@ -248,11 +248,52 @@ fn parse_scale(input: &str) -> IResult<&str, ShapeOp> {
     Ok((input, ShapeOp::Scale(v)))
 }
 
+/// Parses `snap="label"` or `snap="label", tol=0.5` named arguments inside
+/// `Split(axis, …)`. Returns the optional `SnapBinding` and the `tol` value
+/// stored on it (or `None` for the default).
+fn parse_split_snap(input: &str) -> IResult<&str, Option<crate::ops::SnapBinding>> {
+    // Expect a leading comma. If absent, no snap.
+    let Ok((after_comma, _)) = ws::<_, _, Error<&str>>(c_char(',')).parse(input) else {
+        return Ok((input, None));
+    };
+    let Ok((after_eq, _)) = (
+        ws::<_, _, Error<&str>>(tag("snap")),
+        ws::<_, _, Error<&str>>(c_char('=')),
+    )
+        .parse(after_comma)
+    else {
+        return Ok((input, None));
+    };
+    let (after_label, label) = cut(ws(rule_name)).parse(after_eq)?;
+    // Optional `, tol=N`.
+    let mut remaining = after_label;
+    let mut tolerance: Option<f64> = None;
+    if let Ok((after_c, _)) = ws::<_, _, Error<&str>>(c_char(',')).parse(remaining)
+        && let Ok((after_t_eq, _)) = (
+            ws::<_, _, Error<&str>>(tag("tol")),
+            ws::<_, _, Error<&str>>(c_char('=')),
+        )
+            .parse(after_c)
+    {
+        let (after_v, v) = cut(ws(finite_float)).parse(after_t_eq)?;
+        if v < 0.0 {
+            return Err(nom::Err::Failure(Error::new(after_v, ErrorKind::Verify)));
+        }
+        tolerance = Some(v);
+        remaining = after_v;
+    }
+    Ok((
+        remaining,
+        Some(crate::ops::SnapBinding { label, tolerance }),
+    ))
+}
+
 fn parse_split(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Split").parse(input)?;
     // After the "Split" keyword is consumed, any argument error is fatal.
     let (input, _) = cut(ws(c_char('('))).parse(input)?;
     let (input, axis) = cut(ws(parse_axis)).parse(input)?;
+    let (input, snap) = parse_split_snap(input)?;
     let (input, _) = cut(ws(c_char(')'))).parse(input)?;
     let (input, _) = cut(ws(c_char('{'))).parse(input)?;
     // Bounded list: cap allocation before it happens (DoS guard).
@@ -281,7 +322,34 @@ fn parse_split(input: &str) -> IResult<&str, ShapeOp> {
         }
     }
     let (remaining, _) = ws(c_char('}')).parse(remaining)?;
-    Ok((remaining, ShapeOp::Split { axis, slots }))
+    Ok((remaining, ShapeOp::Split { axis, slots, snap }))
+}
+
+/// `RegSnap("label")` — registers all six face planes of the current scope.
+fn parse_reg_snap(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("RegSnap").parse(input)?;
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, label) = cut(ws(rule_name)).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    Ok((input, ShapeOp::RegSnap(label)))
+}
+
+/// `IfClear { Rule }` — invokes `Rule` only when no terminal occludes the scope.
+fn parse_if_clear(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("IfClear").parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
+    let (input, rule) = cut(ws(rule_name)).parse(input)?;
+    let (input, _) = cut(ws(c_char('}'))).parse(input)?;
+    Ok((input, ShapeOp::IfClear { rule }))
+}
+
+/// `IfOccluded { Rule }` — invokes `Rule` only when the scope **is** occluded.
+fn parse_if_occluded(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("IfOccluded").parse(input)?;
+    let (input, _) = cut(ws(c_char('{'))).parse(input)?;
+    let (input, rule) = cut(ws(rule_name)).parse(input)?;
+    let (input, _) = cut(ws(c_char('}'))).parse(input)?;
+    Ok((input, ShapeOp::IfOccluded { rule }))
 }
 
 /// Cap on the number of entries in a `Repeat(axis, [..])` tile-size list.
@@ -393,12 +461,66 @@ fn parse_instance(input: &str) -> IResult<&str, ShapeOp> {
     Ok((input, ShapeOp::I(mesh_id)))
 }
 
-/// Parses `Mat("Brick")` or `Mat(Brick)` — sets material on the current work item.
+/// Cap on the vertex count of a `Polygon(...)` op (DoS hardening).
+const MAX_POLYGON_VERTICES: usize = 256;
+
+/// Parses `Polygon((0,0), (4,0), (4,2), (2,2), (2,4), (0,4))` — a variadic
+/// list of at least 3 `(x, y)` 2-D points. Each point is parsed with
+/// `parse_vec2`; non-finite components are rejected by `finite_float`.
+fn parse_vec2(input: &str) -> IResult<&str, glam::DVec2> {
+    let (input, _) = ws(c_char('(')).parse(input)?;
+    let (input, x) = ws(finite_float).parse(input)?;
+    let (input, _) = ws(c_char(',')).parse(input)?;
+    let (input, y) = ws(finite_float).parse(input)?;
+    let (input, _) = ws(c_char(')')).parse(input)?;
+    Ok((input, glam::DVec2::new(x, y)))
+}
+
+fn parse_polygon(input: &str) -> IResult<&str, ShapeOp> {
+    let (input, _) = tag("Polygon").parse(input)?;
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, first) = cut(ws(parse_vec2)).parse(input)?;
+    let mut verts = vec![first];
+    let mut remaining = input;
+    loop {
+        if verts.len() >= MAX_POLYGON_VERTICES {
+            return Err(nom::Err::Failure(Error::new(
+                remaining,
+                ErrorKind::TooLarge,
+            )));
+        }
+        let Ok((after_comma, _)) = ws::<_, _, Error<&str>>(c_char(',')).parse(remaining) else {
+            break;
+        };
+        let (after_pt, pt) = cut(ws(parse_vec2)).parse(after_comma)?;
+        verts.push(pt);
+        remaining = after_pt;
+    }
+    let (remaining, _) = cut(ws(c_char(')'))).parse(remaining)?;
+    if verts.len() < 3 {
+        return Err(nom::Err::Failure(Error::new(remaining, ErrorKind::Verify)));
+    }
+    Ok((remaining, ShapeOp::Polygon(verts)))
+}
+
+/// Parses `Mat("Brick")` / `Mat(Brick)` (id only) or `Mat("Brick", 1800)` /
+/// `Mat(Brick, 1800)` (id + mass density in kg/m³).
 fn parse_mat(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Mat").parse(input)?;
-    let (input, mat_id) =
-        cut(delimited(ws(c_char('(')), ws(rule_name), ws(c_char(')')))).parse(input)?;
-    Ok((input, ShapeOp::Mat(mat_id)))
+    let (input, _) = cut(ws(c_char('('))).parse(input)?;
+    let (input, mat_id) = cut(ws(rule_name)).parse(input)?;
+    let (input, density) = opt(preceded(ws(c_char(',')), ws(finite_float))).parse(input)?;
+    let (input, _) = cut(ws(c_char(')'))).parse(input)?;
+    if let Some(d) = density
+        && d <= 0.0
+    {
+        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
+    }
+    let material = crate::model::Material {
+        id: mat_id,
+        density,
+    };
+    Ok((input, ShapeOp::Mat(material)))
 }
 
 /// Parses a named world-direction shorthand: `Up`, `Down`, `Right`, `Left`,
@@ -727,12 +849,20 @@ fn parse_op(input: &str) -> IResult<&str, ShapeOp> {
         parse_split,
         parse_repeat,
         parse_comp,
+        // `IfClear` / `IfOccluded` MUST come before `parse_instance` —
+        // `parse_instance` matches `I(` with `cut` (fatal-on-failure), which
+        // greedily consumes the `I` prefix of `IfClear` / `IfOccluded` and
+        // then errors instead of falling through to the alternates.
+        parse_if_clear,
+        parse_if_occluded,
         parse_instance,
         parse_mat,
         parse_align,
         parse_offset,
         parse_roof,
         parse_attach,
+        parse_polygon,
+        parse_reg_snap,
         parse_rule_ref,
     ))
     .parse(input)
@@ -1000,7 +1130,7 @@ mod tests {
     fn test_parse_split_y() {
         let ops = parse_ops("Split(Y) { ~1.0: Floor | ~1.0: Floor | 2.0: Roof }").unwrap();
         assert_eq!(ops.len(), 1);
-        let ShapeOp::Split { axis, slots } = &ops[0] else {
+        let ShapeOp::Split { axis, slots, .. } = &ops[0] else {
             panic!("expected Split");
         };
         assert_eq!(*axis, Axis::Y);
@@ -1043,9 +1173,28 @@ mod tests {
     #[test]
     fn test_parse_mat() {
         let ops = parse_ops(r#"Mat("Brick")"#).unwrap();
-        assert_eq!(ops[0], ShapeOp::Mat("Brick".to_string()));
+        assert_eq!(ops[0], ShapeOp::Mat(crate::model::Material::new("Brick")));
         let ops2 = parse_ops("Mat(Stone)").unwrap();
-        assert_eq!(ops2[0], ShapeOp::Mat("Stone".to_string()));
+        assert_eq!(ops2[0], ShapeOp::Mat(crate::model::Material::new("Stone")));
+    }
+
+    #[test]
+    fn test_parse_mat_with_density() {
+        let ops = parse_ops(r#"Mat("Brick", 1800)"#).unwrap();
+        assert_eq!(
+            ops[0],
+            ShapeOp::Mat(crate::model::Material::with_density("Brick", 1800.0))
+        );
+    }
+
+    #[test]
+    fn test_parse_mat_zero_density_rejected() {
+        assert!(parse_ops("Mat(Stone, 0)").is_err());
+    }
+
+    #[test]
+    fn test_parse_mat_negative_density_rejected() {
+        assert!(parse_ops("Mat(Stone, -5)").is_err());
     }
 
     #[test]

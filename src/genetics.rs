@@ -100,10 +100,17 @@ impl Genotype for ShapeGenotype {
     /// independent jitter from producing `SplitOverflow` errors at interpret time
     /// (issue #27).
     fn mutate<R: Rng>(&mut self, rng: &mut R, rate: f32) {
-        for variants in self.rules.values_mut() {
-            for variant in variants.iter_mut() {
-                for op in variant.ops.iter_mut() {
-                    mutate_op(op, rng, rate);
+        // Iterate by sorted key so the per-op RNG draws are deterministic for
+        // a given seed — `HashMap`'s default value iteration order is not.
+        let mut keys: Vec<&String> = self.rules.keys().collect();
+        keys.sort();
+        let keys: Vec<String> = keys.into_iter().cloned().collect();
+        for key in keys {
+            if let Some(variants) = self.rules.get_mut(&key) {
+                for variant in variants.iter_mut() {
+                    for op in variant.ops.iter_mut() {
+                        mutate_op(op, rng, rate);
+                    }
                 }
             }
         }
@@ -213,6 +220,12 @@ fn mutate_op<R: Rng>(op: &mut ShapeOp, rng: &mut R, rate: f32) {
             config.pitch = jitter(rng, rate, config.pitch, 5.0).clamp(1.0, 89.0);
             config.overhang = jitter(rng, rate, config.overhang, 0.2).clamp(0.0, 2.0);
         }
+        ShapeOp::Polygon(verts) => {
+            for v in verts.iter_mut() {
+                v.x = jitter(rng, rate, v.x, 0.2);
+                v.y = jitter(rng, rate, v.y, 0.2);
+            }
+        }
         // Non-parametric ops have no float to jitter.
         ShapeOp::Rotate(_)
         | ShapeOp::Comp(_)
@@ -221,7 +234,10 @@ fn mutate_op<R: Rng>(op: &mut ShapeOp, rng: &mut R, rate: f32) {
         | ShapeOp::Mat(_)
         | ShapeOp::Rule(_)
         | ShapeOp::Align { .. }
-        | ShapeOp::Attach { .. } => {}
+        | ShapeOp::Attach { .. }
+        | ShapeOp::RegSnap(_)
+        | ShapeOp::IfClear { .. }
+        | ShapeOp::IfOccluded { .. } => {}
     }
 }
 
@@ -327,6 +343,7 @@ fn same_op_kind(a: &ShapeOp, b: &ShapeOp) -> bool {
             | (Offset { .. }, Offset { .. })
             | (Roof { .. }, Roof { .. })
             | (Attach { .. }, Attach { .. })
+            | (Polygon(_), Polygon(_))
     )
 }
 
@@ -371,10 +388,11 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             ShapeOp::Split {
                 axis,
                 slots: slots_a,
+                snap,
             },
             ShapeOp::Split { slots: slots_b, .. },
         ) => {
-            // Blend slot sizes pairwise; keep rules and axis from parent A.
+            // Blend slot sizes pairwise; keep rules, axis and snap binding from parent A.
             let slots = if slots_a.len() == slots_b.len() {
                 slots_a
                     .iter()
@@ -387,7 +405,11 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
             } else {
                 slots_a.clone()
             };
-            ShapeOp::Split { axis: *axis, slots }
+            ShapeOp::Split {
+                axis: *axis,
+                slots,
+                snap: snap.clone(),
+            }
         }
         (
             ShapeOp::Repeat {

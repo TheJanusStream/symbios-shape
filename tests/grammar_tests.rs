@@ -44,7 +44,7 @@ fn parse_taper_out_of_range() {
 #[test]
 fn parse_split_x_absolute() {
     let ops = parse_ops("Split(X) { 3.0: Left | 7.0: Right }").unwrap();
-    let ShapeOp::Split { axis, slots } = &ops[0] else {
+    let ShapeOp::Split { axis, slots, .. } = &ops[0] else {
         panic!()
     };
     assert_eq!(*axis, Axis::X);
@@ -57,7 +57,7 @@ fn parse_split_x_absolute() {
 #[test]
 fn parse_split_z_floating() {
     let ops = parse_ops("Split(Z) { ~2.0: Front | ~1.0: Back }").unwrap();
-    let ShapeOp::Split { axis, slots } = &ops[0] else {
+    let ShapeOp::Split { axis, slots, .. } = &ops[0] else {
         panic!()
     };
     assert_eq!(*axis, Axis::Z);

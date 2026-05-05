@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 
+use crate::model::Material;
 use crate::scope::{Quat, Vec3};
+
+/// Optional snap-binding attached to a `Split` op.
+///
+/// When set, after the slot sizes are resolved the interior boundaries are
+/// snapped to the nearest registered snap-plane along the split axis carrying
+/// the matching `label`, provided the snap-plane lies within `tolerance`
+/// world-space units of the resolved boundary. Slots on either side of a
+/// snapped boundary stretch / shrink to absorb the offset; total scope
+/// length is preserved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapBinding {
+    /// Group label of snap-planes to align to (matches `RegSnap("label")`).
+    pub label: String,
+    /// Maximum world-space distance between a slot boundary and a snap-plane
+    /// for the snap to apply. When `None`, defaults to `5%` of the split-axis
+    /// scope length at interpret time.
+    pub tolerance: Option<f64>,
+}
 
 /// The axis along which a `Split` or `Repeat` operation acts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,7 +356,14 @@ pub enum ShapeOp {
     Scale(Vec3),
 
     /// Divides the scope along `axis` into ordered slots.
-    Split { axis: Axis, slots: Vec<SplitSlot> },
+    ///
+    /// When `snap` is `Some`, interior slot boundaries are snapped to the
+    /// nearest registered snap-plane along `axis` (see [`SnapBinding`]).
+    Split {
+        axis: Axis,
+        slots: Vec<SplitSlot>,
+        snap: Option<SnapBinding>,
+    },
 
     /// Tiles the scope along `axis` with child scopes drawn from `tile_sizes`.
     ///
@@ -363,11 +389,16 @@ pub enum ShapeOp {
     /// This is the "terminal symbol" — produces a `Terminal` node in the output model.
     I(String),
 
-    /// Sets the material identifier on the current work item.
+    /// Sets the material on the current work item.
     /// The material is propagated to the final `Terminal`, allowing downstream
-    /// renderers to apply textures/shaders without changing the scope.
-    /// Syntax: `Mat("Brick")` or `Mat(Brick)`.
-    Mat(String),
+    /// renderers to apply textures / shaders and physics consumers to derive
+    /// volumetric mass properties without changing the scope.
+    ///
+    /// Syntax:
+    /// - `Mat("Brick")` / `Mat(Brick)` — id-only material; no density.
+    /// - `Mat("Brick", 1800)` — id + density in kg/m³; the interpreter computes
+    ///   [`crate::model::MassProperties`] for terminals stamped with this material.
+    Mat(Material),
 
     /// Calls a named sub-rule on the current scope unchanged.
     /// Used for grammar rule references that don't transform the scope themselves.
@@ -409,6 +440,44 @@ pub enum ShapeOp {
         config: RoofConfig,
         cases: Vec<RoofCase>,
     },
+
+    /// Registers all six face planes of the current scope as snap-planes
+    /// under the given label. Subsequent `Split(snap="label")` ops can align
+    /// their interior boundaries to these planes. Read-only with respect to
+    /// the scope (the scope itself passes through unchanged).
+    ///
+    /// Syntax: `RegSnap("bays")`
+    RegSnap(String),
+
+    /// Conditionally invokes `rule` on the current scope only when no
+    /// already-emitted terminal occludes the scope (true OBB overlap test).
+    /// Useful for placing decorative elements that should only appear where
+    /// no structural element has already been placed.
+    ///
+    /// The grammar author is responsible for ordering — terminals derived
+    /// before this op participate in the test; later terminals do not.
+    ///
+    /// Syntax: `IfClear { Window }`
+    IfClear { rule: String },
+
+    /// Inverse of [`ShapeOp::IfClear`]: invokes `rule` only when the current
+    /// scope **is** occluded by an already-emitted terminal.
+    ///
+    /// Syntax: `IfOccluded { Patch }`
+    IfOccluded { rule: String },
+
+    /// Stamps an explicit polygonal `FaceProfile` on the next terminal in this rule.
+    ///
+    /// Mirrors how [`ShapeOp::Taper`] sets a profile override: the next `I(...)`
+    /// (or implicit terminal) emits a `Terminal` whose `face_profile` is
+    /// [`crate::model::FaceProfile::Polygon`] with the provided vertex list.
+    /// Vertices are 2-D points in the scope's local floor plane (XZ), measured
+    /// in world units from the scope origin; the renderer triangulates and
+    /// extrudes along the local Y axis.
+    ///
+    /// Syntax: `Polygon((0,0), (4,0), (4,2), (2,2), (2,4), (0,4))`
+    /// (variadic `(x,y)` list, capped at 256 vertices for parser DoS hardening).
+    Polygon(Vec<glam::DVec2>),
 
     /// Projects a new horizontal scope out of a sloped face for attaching dormers or details.
     ///

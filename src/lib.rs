@@ -10,12 +10,13 @@
 //! ## Key Features
 //!
 //! - **Lightweight**: Depends only on `glam` (math), `nom` (parsing), `rand` (stochastic rules), and optionally `symbios-genetics` — no engine or runtime required.
-//! - **CGA-Compatible Operations**: `Extrude`, `Split`, `Comp`, `Repeat`, `Taper`, `Scale`, `Translate`, `Rotate`, `Align`, `Offset`, `Roof`, `Attach`, `I`, `Mat`.
+//! - **CGA-Compatible Operations**: `Extrude`, `Split` (with optional `snap=` binding), `Comp`, `Repeat`, `Taper`, `Scale`, `Translate`, `Rotate`, `Align`, `Offset`, `Roof`, `Attach`, `Polygon`, `RegSnap`, `IfClear`, `IfOccluded`, `I`, `Mat`.
 //! - **15 Roof Types**: Pyramid, Shed, Gable, Hip, Flat, OpenGable, BoxGable, PyramidHip, Butterfly, MShaped, Gambrel, Mansard, Saltbox, Jerkinhead, DutchGable.
 //! - **Flexible Split Sizing**: Absolute, relative (`'`), and floating (`~`) modes.
 //! - **Rich Face Profiles**: `FaceProfile` describes each terminal's cross-section (Rectangle, Taper, Triangle, Trapezoid, Polygon).
+//! - **Mass Model**: `Material { id, density }` + `MassProperties { mass, centroid, inertia }` computed on Terminal for physics / LOD / IK consumers.
 //! - **Genetic Evolution**: `ShapeGenotype` wraps the rule table for `symbios-genetics` algorithms.
-//! - **Bevy-Ready Output**: `ShapeModel` containing `Terminal` nodes with scope, mesh_id, face_profile, and material.
+//! - **Bevy-Ready Output**: `ShapeModel` containing `Terminal` nodes with scope, mesh_id, face_profile, material, and mass_properties.
 //!
 //! ## Example
 //!
@@ -46,13 +47,15 @@ pub mod grammar;
 pub mod interpreter;
 pub mod model;
 pub mod ops;
+pub mod query;
 pub mod scope;
 
 pub use error::ShapeError;
 pub use interpreter::Interpreter;
-pub use model::{FaceProfile, ShapeModel, Terminal};
+pub use model::{FaceProfile, MassProperties, Material, ShapeModel, SnapPlane, Terminal};
 pub use ops::{
     AttachCase, AttachSelector, Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector,
-    RoofCase, RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
+    RoofCase, RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SnapBinding, SplitSize, SplitSlot,
 };
+pub use query::{TerminalQuery, obb_overlap};
 pub use scope::{Quat, Scope, Vec3};

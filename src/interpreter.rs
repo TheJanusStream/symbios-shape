@@ -14,10 +14,13 @@ use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ShapeError;
-use crate::model::{FaceProfile, ShapeModel, Terminal, taper_to_profile};
+use crate::model::{FaceProfile, Material, ShapeModel, Terminal, taper_to_profile};
 use crate::ops::{
     AttachCase, AttachSelector, Axis, CompTarget, FaceSelector, OffsetCase, OffsetSelector,
     RoofCase, RoofConfig, RoofFaceSelector, RoofType, ShapeOp, SplitSize, SplitSlot,
+};
+use crate::query::{
+    register_scope_snap_planes, scope_obb_overlaps_terminal, snap_split_boundaries,
 };
 use crate::scope::{Quat, Scope, Vec3};
 
@@ -49,8 +52,8 @@ struct WorkItem {
     /// Explicit face profile set by `Roof` panel generation; overrides `taper`
     /// when computing the terminal's `face_profile`.
     face_profile_override: Option<FaceProfile>,
-    /// Material identifier set by `Mat("...")` ops; propagates to child scopes.
-    material: Option<String>,
+    /// Material set by `Mat("...")` ops; propagates to child scopes.
+    material: Option<Material>,
 }
 
 // ── Split size resolution ─────────────────────────────────────────────────────
@@ -377,7 +380,7 @@ fn apply_roof(
     cases: &[RoofCase],
     scope: &Scope,
     depth: usize,
-    material: &Option<String>,
+    material: &Option<Material>,
     queue: &mut VecDeque<WorkItem>,
     model: &mut ShapeModel,
     max_terminals: usize,
@@ -1664,7 +1667,7 @@ impl Interpreter {
         initial_scope: Scope,
         initial_taper: f64,
         initial_face_profile: Option<FaceProfile>,
-        initial_material: Option<String>,
+        initial_material: Option<Material>,
         ops: &[ShapeOp],
         depth: usize,
         queue: &mut VecDeque<WorkItem>,
@@ -1740,8 +1743,71 @@ impl Interpreter {
                     }
                 }
 
-                ShapeOp::Mat(mat_id) => {
-                    material = Some(mat_id.clone());
+                ShapeOp::Mat(mat) => {
+                    material = Some(mat.clone());
+                }
+
+                ShapeOp::Polygon(verts) => {
+                    if verts.len() < 3 {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
+                    for v in verts {
+                        if !v.is_finite() {
+                            return Err(ShapeError::InvalidNumericValue);
+                        }
+                    }
+                    face_profile = Some(FaceProfile::Polygon(verts.clone()));
+                }
+
+                // ── Snap-plane registration ──────────────────────────────
+                ShapeOp::RegSnap(label) => {
+                    register_scope_snap_planes(&scope, label, &mut model.snap_planes);
+                }
+
+                // ── Conditional: IfClear / IfOccluded ────────────────────
+                // Both consult the model-so-far. IfClear pushes the rule only
+                // when no already-emitted terminal overlaps the current scope;
+                // IfOccluded is the inverse. The current rule body terminates
+                // either way (these are branching ops).
+                ShapeOp::IfClear { rule } => {
+                    let occluded = model
+                        .terminals
+                        .iter()
+                        .any(|t| scope_obb_overlaps_terminal(&scope, t));
+                    if !occluded {
+                        if queue.len() >= MAX_QUEUE {
+                            return Err(ShapeError::CapacityOverflow);
+                        }
+                        queue.push_back(WorkItem {
+                            scope,
+                            rule: rule.clone(),
+                            depth: depth + 1,
+                            taper,
+                            face_profile_override: face_profile.take(),
+                            material: material.clone(),
+                        });
+                    }
+                    return Ok(());
+                }
+                ShapeOp::IfOccluded { rule } => {
+                    let occluded = model
+                        .terminals
+                        .iter()
+                        .any(|t| scope_obb_overlaps_terminal(&scope, t));
+                    if occluded {
+                        if queue.len() >= MAX_QUEUE {
+                            return Err(ShapeError::CapacityOverflow);
+                        }
+                        queue.push_back(WorkItem {
+                            scope,
+                            rule: rule.clone(),
+                            depth: depth + 1,
+                            taper,
+                            face_profile_override: face_profile.take(),
+                            material: material.clone(),
+                        });
+                    }
+                    return Ok(());
                 }
 
                 // ── Transform: Align ─────────────────────────────────────
@@ -1906,13 +1972,28 @@ impl Interpreter {
                 }
 
                 // ── Branching: Split ──────────────────────────────────────
-                ShapeOp::Split { axis, slots } => {
+                ShapeOp::Split { axis, slots, snap } => {
                     let total = match axis {
                         Axis::X => scope.size.x,
                         Axis::Y => scope.size.y,
                         Axis::Z => scope.size.z,
                     };
-                    let sizes = resolve_split_sizes(slots, total)?;
+                    let mut sizes = resolve_split_sizes(slots, total)?;
+                    // Snap-aware adjustment: shift interior boundaries to the
+                    // nearest registered snap-plane along `axis` if within
+                    // tolerance, then redistribute the offset across the two
+                    // adjacent slot widths.
+                    if let Some(binding) = snap {
+                        let tol = binding.tolerance.unwrap_or(0.05 * total);
+                        snap_split_boundaries(
+                            &scope,
+                            *axis,
+                            &mut sizes,
+                            &binding.label,
+                            tol,
+                            &model.snap_planes,
+                        );
+                    }
                     if queue.len() + slots.len() > MAX_QUEUE {
                         return Err(ShapeError::CapacityOverflow);
                     }
@@ -2162,6 +2243,7 @@ mod tests {
                     slot(SplitSize::Floating(1.0), "Upper"),
                     slot(SplitSize::Absolute(1.5), "Roof"),
                 ],
+                snap: None,
             }],
         );
         let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 10.0, 10.0));
@@ -2229,12 +2311,12 @@ mod tests {
         interp.add_rule(
             "R",
             vec![
-                ShapeOp::Mat("Brick".to_string()),
+                ShapeOp::Mat(Material::new("Brick")),
                 ShapeOp::I("Wall".to_string()),
             ],
         );
         let model = interp.derive(Scope::unit(), "R").unwrap();
-        assert_eq!(model.terminals[0].material, Some("Brick".to_string()));
+        assert_eq!(model.terminals[0].material, Some(Material::new("Brick")));
     }
 
     // ── Issue 1: empty-variants panic ─────────────────────────────────────────

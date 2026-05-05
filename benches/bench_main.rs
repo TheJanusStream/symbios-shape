@@ -30,6 +30,7 @@ fn bench_simple_building(c: &mut Criterion) {
                         make_slot(SplitSize::Floating(1.0), "Upper"),
                         make_slot(SplitSize::Absolute(2.0), "Roof"),
                     ],
+                    snap: None,
                 }],
             );
             interp.add_rule(
@@ -79,6 +80,7 @@ fn bench_deep_split(c: &mut Criterion) {
                             make_slot(SplitSize::Floating(1.0), &next),
                             make_slot(SplitSize::Floating(1.0), &next),
                         ],
+                        snap: None,
                     }],
                 );
             }

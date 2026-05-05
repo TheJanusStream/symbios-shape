@@ -66,23 +66,27 @@ for t in &model.terminals {
 
 ### Operations
 
-| Op        | Syntax                                                          | Description                                    |
-|-----------|-----------------------------------------------------------------|------------------------------------------------|
-| Extrude   | `Extrude(h)`                                                    | Set Y size to `h` (h > 0)                      |
-| Taper     | `Taper(t)`                                                      | Pyramidal taper, t ∈ [0, 1]                    |
-| Scale     | `Scale(x, y, z)`                                                | Multiply scope size (all > 0)                  |
-| Translate | `Translate(x, y, z)`                                            | Shift origin in local space                    |
-| Rotate    | `Rotate(w, x, y, z)`                                            | Apply quaternion rotation                      |
-| Align     | `Align(Y, Up)`                                                  | Rotate so local axis points at world direction |
-| Split     | `Split(Y) { 3: A \| ~1: B \| '0.2: C }`                         | Divide along axis                              |
-| Repeat    | `Repeat(X, 2.5) { Window }` or `Repeat(X, [2, 1.5, 3]) { Bay }` | Tile along axis, stretch to fill               |
-| Comp      | `Comp(Faces) { Top: R \| Side: R \| Bottom: R }`                | Decompose into face scopes                     |
-| Offset    | `Offset(-0.2) { Inside: R \| Border: R }`                       | Inset a 2D face scope                          |
-| Roof      | `Roof(Gable, 30) { Slope: R \| GableEnd: R }`                   | Generate roof geometry                         |
-| Attach    | `Attach(Up) { Surface: R }`                                     | Project a scope onto a sloped face             |
-| I         | `I("MeshId")` or `I(MeshId)`                                    | Emit terminal                                  |
-| Mat       | `Mat("Brick")` or `Mat(Brick)`                                  | Set material (propagates to terminal)          |
-| Rule ref  | `RuleName`                                                      | Delegate to another rule                       |
+| Op        | Syntax                                                          | Description                                                                  |
+|-----------|-----------------------------------------------------------------|------------------------------------------------------------------------------|
+| Extrude   | `Extrude(h)`                                                    | Set Y size to `h` (h > 0)                                                    |
+| Taper     | `Taper(t)`                                                      | Pyramidal taper, t ∈ [0, 1]                                                  |
+| Scale     | `Scale(x, y, z)`                                                | Multiply scope size (all > 0)                                                |
+| Translate | `Translate(x, y, z)`                                            | Shift origin in local space                                                  |
+| Rotate    | `Rotate(w, x, y, z)`                                            | Apply quaternion rotation                                                    |
+| Align     | `Align(Y, Up)`                                                  | Rotate so local axis points at world direction                               |
+| Split     | `Split(Y) { 3: A \| ~1: B \| '0.2: C }`                         | Divide along axis (see Snap-aware Split below)                               |
+| Repeat    | `Repeat(X, 2.5) { Window }` or `Repeat(X, [2, 1.5, 3]) { Bay }` | Tile along axis, stretch to fill                                             |
+| Comp      | `Comp(Faces) { Top: R \| Side: R \| Bottom: R }`                | Decompose into face scopes                                                   |
+| Offset    | `Offset(-0.2) { Inside: R \| Border: R }`                       | Inset a 2D face scope                                                        |
+| Roof      | `Roof(Gable, 30) { Slope: R \| GableEnd: R }`                   | Generate roof geometry                                                       |
+| Attach    | `Attach(Up) { Surface: R }`                                     | Project a scope onto a sloped face                                           |
+| I         | `I("MeshId")` or `I(MeshId)`                                    | Emit terminal                                                                |
+| Mat       | `Mat("Brick")` or `Mat("Brick", 1800)`                          | Set material (id, optional density kg/m³)                                    |
+| Polygon   | `Polygon((0,0), (4,0), (4,2), (2,2), (2,4), (0,4))`             | Stamp a polygon FaceProfile on next terminal                                 |
+| RegSnap   | `RegSnap("bays")`                                               | Register the 6 face planes of the current scope as snap-planes under a label |
+| IfClear   | `IfClear { Window }`                                            | Invoke rule only if no terminal occludes the scope (OBB test)                |
+| IfOccluded| `IfOccluded { Patch }`                                          | Invoke rule only if a terminal occludes the scope                            |
+| Rule ref  | `RuleName`                                                      | Delegate to another rule                                                     |
 
 ### Split Sizes
 
@@ -180,6 +184,98 @@ the fascia faces horizontally outward. Supported on `Gable`, `Hip`, `Pyramid`,
 `PyramidHip`, `Shed`, `BoxGable`, `OpenGable`, `Saltbox`, `Jerkinhead`,
 `DutchGable`, `Gambrel`, `Mansard`, and the outer slopes of `MShaped`.
 `Flat` and `Butterfly` produce no fascia panels (no horizontal perimeter eave).
+
+### Polygon
+
+Stamps an explicit polygonal `FaceProfile` on the next terminal in the rule —
+the same override mechanism that `Taper(t)` uses. Vertices are 2-D `(x, y)`
+points in the scope's local floor plane (XZ), measured in world units; the
+renderer triangulates and extrudes along the local Y axis.
+
+```text
+Polygon((0,0), (4,0), (4,2), (2,2), (2,4), (0,4)) I("Mass")
+```
+
+Useful for L-shaped, T-shaped, or otherwise non-rectangular footprints. Capped
+at 256 vertices; minimum 3.
+
+### Snap-lines (`RegSnap` + `Split(snap=...)`)
+
+`RegSnap("label")` records all six face planes of the current scope into the
+[`ShapeModel::snap_planes`](src/model.rs) registry under the given label. A
+snap-aware `Split` reads that registry and shifts its interior boundaries to
+the nearest matching plane along its split axis when within tolerance.
+
+```text
+GroundLeft --> RegSnap("bays") I("LeftFloor")           # registers planes
+Upper      --> Split(X, snap="bays") { 4.5: Bay | 5.5: Bay }    # snaps to bays
+Upper      --> Split(X, snap="bays", tol=0.5) { … }     # explicit tolerance
+```
+
+Default `tol` is **5%** of the split axis length. The snap match requires the
+plane normal to be parallel (within ~25°) to the split axis, and the plane to
+fall within `tol` world units of the resolved boundary; on a hit, the
+boundary moves to the plane and the two adjacent slot widths absorb the
+offset (slot total is preserved).
+
+**BFS-order caveat**: a snap-aware `Split` only sees planes registered by
+rules already drained from the queue. If you want Upper bays to snap to
+Ground bay edges, structure the grammar so Upper (or its ancestors) reach
+their snap-aware Split *after* Ground's bay rules execute their `RegSnap`
+— e.g. add one rule of indirection on Upper.
+
+### Occlusion query (`IfClear` / `IfOccluded`)
+
+Both ops invoke a sub-rule conditionally based on whether the current scope
+overlaps any already-emitted terminal. The overlap test is a true OBB-vs-OBB
+check via the Separating Axis Theorem (handles rotated and thin face scopes).
+
+```text
+Window --> IfClear { WindowMesh }    # only if no terminal occludes the scope
+Patch  --> IfOccluded { PatchMesh }  # only if a terminal does occlude
+```
+
+The query is also exposed on `ShapeModel` for post-derivation use:
+
+```rust
+let q = model.query();
+if q.overlaps(&candidate_scope) { /* ... */ }
+for hit in q.overlapping(&candidate_scope) { /* ... */ }
+```
+
+The `IfClear` / `IfOccluded` ops consult the model **at the moment they are
+processed** — same BFS-order caveat as snap-lines: structural elements must
+be derived before the conditional ops that depend on them.
+
+### Mat
+
+Sets the material on the next terminal. The material carries an asset
+identifier and an optional mass density in kg/m³. When density is supplied,
+the interpreter computes [`MassProperties`](#mass-properties) for every
+terminal stamped with this material.
+
+```text
+Mat("Brick")          # id only — no density, no mass properties
+Mat("Brick", 1800)    # id + density (kg/m³)
+```
+
+### Mass properties
+
+Each `Terminal` has an optional `mass_properties: Option<MassProperties>`
+populated when its material has a density. `MassProperties` carries:
+
+- `mass` (kg) — `density × volume` of the terminal's solid form.
+- `centroid` (`Vec3`) — world-frame centre of mass.
+- `inertia` (`Option<DMat3>`) — moment-of-inertia tensor about the centroid
+  in the world frame, in kg·m². Closed-form is implemented for `Rectangle`,
+  `Triangle`, `Trapezoid`, and `Polygon` profiles. `Taper(t)` populates mass
+  and centroid (frustum formulas) but leaves inertia `None`.
+
+Mass propagates correctly through `Split`, `Comp`, and `Repeat` because
+`Mat(...)` is recorded on the work item before branching, then re-applied to
+each child terminal. Downstream consumers (e.g. `bevy_symbios_shape`) can
+read `mass_properties` directly for physics, LOD, and IK without
+recomputing volumes.
 
 ### Attach
 
