@@ -94,6 +94,11 @@ impl Genotype for ShapeGenotype {
     /// | `Repeat` tile_size | tile_size | 0.3 | > 0.1 |
     /// | `Roof` angle | angle (°) | 5.0 | [1, 89] |
     /// | `Roof` overhang | overhang | 0.2 | [0, 2] |
+    ///
+    /// After per-slot jitter, each `Split` is repaired so that its absolute and
+    /// relative slot sums do not exceed their pre-mutation totals — this prevents
+    /// independent jitter from producing `SplitOverflow` errors at interpret time
+    /// (issue #27).
     fn mutate<R: Rng>(&mut self, rng: &mut R, rate: f32) {
         for variants in self.rules.values_mut() {
             for variant in variants.iter_mut() {
@@ -188,12 +193,21 @@ fn mutate_op<R: Rng>(op: &mut ShapeOp, rng: &mut R, rate: f32) {
             );
         }
         ShapeOp::Split { slots, .. } => {
+            // Snapshot pre-mutation sums so we can prevent absolute / relative
+            // sums from growing past their original totals. Without this guard
+            // independent per-slot Gaussian jitter can push Σ(absolute) past
+            // the scope dimension and trip `SplitOverflow` at interpret time.
+            let original_abs_sum = sum_split_size(slots, |s| matches!(s, SplitSize::Absolute(_)));
+            let original_rel_sum = sum_split_size(slots, |s| matches!(s, SplitSize::Relative(_)));
             for slot in slots.iter_mut() {
                 mutate_split_size(&mut slot.size, rng, rate);
             }
+            repair_split_sums(slots, original_abs_sum, original_rel_sum);
         }
-        ShapeOp::Repeat { tile_size, .. } => {
-            *tile_size = jitter(rng, rate, *tile_size, 0.3).max(0.1);
+        ShapeOp::Repeat { tile_sizes, .. } => {
+            for ts in tile_sizes.iter_mut() {
+                *ts = jitter(rng, rate, *ts, 0.3).max(0.1);
+            }
         }
         ShapeOp::Roof { config, .. } => {
             config.pitch = jitter(rng, rate, config.pitch, 5.0).clamp(1.0, 89.0);
@@ -216,6 +230,48 @@ fn mutate_split_size<R: Rng>(size: &mut SplitSize, rng: &mut R, rate: f32) {
         SplitSize::Absolute(v) => *v = jitter(rng, rate, *v, 0.3).max(0.1),
         SplitSize::Relative(v) => *v = jitter(rng, rate, *v, 0.05).clamp(0.01, 1.0),
         SplitSize::Floating(v) => *v = jitter(rng, rate, *v, 0.3).max(0.1),
+    }
+}
+
+/// Sums size values of slots whose `SplitSize` matches `kind`.
+fn sum_split_size<F>(slots: &[crate::ops::SplitSlot], kind: F) -> f64
+where
+    F: Fn(&SplitSize) -> bool,
+{
+    slots
+        .iter()
+        .filter(|s| kind(&s.size))
+        .map(|s| match s.size {
+            SplitSize::Absolute(v) | SplitSize::Relative(v) | SplitSize::Floating(v) => v,
+        })
+        .sum()
+}
+
+/// Prevents Split absolute / relative slot sums from growing past their
+/// pre-mutation totals. Each affected slot is scaled down proportionally,
+/// preserving the relative weights chosen by the mutation.
+fn repair_split_sums(
+    slots: &mut [crate::ops::SplitSlot],
+    original_abs_sum: f64,
+    original_rel_sum: f64,
+) {
+    let new_abs_sum = sum_split_size(slots, |s| matches!(s, SplitSize::Absolute(_)));
+    if original_abs_sum > 1e-9 && new_abs_sum > original_abs_sum {
+        let scale = original_abs_sum / new_abs_sum;
+        for slot in slots.iter_mut() {
+            if let SplitSize::Absolute(v) = &mut slot.size {
+                *v = (*v * scale).max(0.1);
+            }
+        }
+    }
+    let new_rel_sum = sum_split_size(slots, |s| matches!(s, SplitSize::Relative(_)));
+    if original_rel_sum > 1e-9 && new_rel_sum > original_rel_sum {
+        let scale = original_rel_sum / new_rel_sum;
+        for slot in slots.iter_mut() {
+            if let SplitSize::Relative(v) = &mut slot.size {
+                *v = (*v * scale).clamp(0.01, 1.0);
+            }
+        }
     }
 }
 
@@ -336,15 +392,27 @@ fn blend_op<R: Rng>(a: &ShapeOp, b: &ShapeOp, rng: &mut R) -> ShapeOp {
         (
             ShapeOp::Repeat {
                 axis,
-                tile_size: tsa,
+                tile_sizes: tsa,
                 rule,
             },
-            ShapeOp::Repeat { tile_size: tsb, .. },
-        ) => ShapeOp::Repeat {
-            axis: *axis,
-            tile_size: blx(*tsa, *tsb, 0.5, rng).max(0.1),
-            rule: rule.clone(),
-        },
+            ShapeOp::Repeat {
+                tile_sizes: tsb, ..
+            },
+        ) => {
+            let blended: Vec<f64> = if tsa.len() == tsb.len() {
+                tsa.iter()
+                    .zip(tsb.iter())
+                    .map(|(a, b)| blx(*a, *b, 0.5, rng).max(0.1))
+                    .collect()
+            } else {
+                tsa.clone()
+            };
+            ShapeOp::Repeat {
+                axis: *axis,
+                tile_sizes: blended,
+                rule: rule.clone(),
+            }
+        }
         (ShapeOp::Roof { config: ca, cases }, ShapeOp::Roof { config: cb, .. }) => {
             let mut config = ca.clone();
             config.pitch = blx(ca.pitch, cb.pitch, 0.5, rng).clamp(1.0, 89.0);
@@ -495,5 +563,61 @@ mod tests {
         let mut rng = Pcg64::seed_from_u64(42);
         let result = blx(5.0, 5.0, 0.5, &mut rng);
         assert!((result - 5.0).abs() < 1e-9);
+    }
+
+    /// Property test for issue #27: 1000 random heavy-mutation passes against a
+    /// rich grammar (every parametric op kind) must never produce a genotype that
+    /// fails to interpret. Each pass is also exercised against multiple footprints.
+    #[test]
+    fn test_mutate_property_1000_genotypes_all_interpret() {
+        use crate::scope::{Quat, Scope, Vec3};
+        use rand::SeedableRng;
+
+        // Grammar that exercises every parametric op kind so the property test
+        // covers Extrude, Taper, Scale, Translate, Split (all 3 SplitSize kinds),
+        // Repeat, and Roof (pitch + overhang).
+        let mut interp = Interpreter::new();
+        interp.add_rule(
+            "Lot",
+            parse_ops("Extrude(8) Split(Y) { 3: Floor | ~1: Mid | '0.2: Cap | 1.5: Top }").unwrap(),
+        );
+        interp.add_rule("Floor", parse_ops("Repeat(X, 2.0) { Bay }").unwrap());
+        interp.add_rule(
+            "Bay",
+            parse_ops(r#"Scale(0.9, 0.9, 0.9) Translate(0.1, 0, 0) I("Bay")"#).unwrap(),
+        );
+        interp.add_rule("Mid", parse_ops(r#"Taper(0.3) I("Mid")"#).unwrap());
+        interp.add_rule("Cap", parse_ops(r#"I("Cap")"#).unwrap());
+        interp.add_rule(
+            "Top",
+            parse_ops("Roof(Gable, 35) { Slope: Tile | GableEnd: Brick }").unwrap(),
+        );
+
+        let footprint = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(10.0, 0.0, 6.0));
+
+        let dna_seed = ShapeGenotype::from_interpreter(&interp);
+        let mut failures: Vec<(u64, String)> = Vec::new();
+
+        for seed in 0u64..1000 {
+            let mut dna = dna_seed.clone();
+            let mut rng = Pcg64::seed_from_u64(seed);
+            // High rate (1.0) and multiple passes guarantee every parametric float
+            // is jittered many times, exercising the clamp boundaries hard.
+            for _ in 0..3 {
+                dna.mutate(&mut rng, 1.0);
+            }
+            let interp = dna.to_interpreter();
+            match interp.derive(footprint, "Lot") {
+                Ok(_) => {}
+                Err(e) => failures.push((seed, format!("{e:?}"))),
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} of 1000 mutated genotypes failed to interpret. First failures: {:?}",
+            failures.len(),
+            failures.iter().take(5).collect::<Vec<_>>(),
+        );
     }
 }

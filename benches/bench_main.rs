@@ -36,7 +36,7 @@ fn bench_simple_building(c: &mut Criterion) {
                 "Ground",
                 vec![ShapeOp::Repeat {
                     axis: Axis::X,
-                    tile_size: 2.0,
+                    tile_sizes: vec![2.0],
                     rule: "ShopWindow".to_string(),
                 }],
             );
@@ -44,7 +44,7 @@ fn bench_simple_building(c: &mut Criterion) {
                 "Upper",
                 vec![ShapeOp::Repeat {
                     axis: Axis::X,
-                    tile_size: 2.0,
+                    tile_sizes: vec![2.0],
                     rule: "Window".to_string(),
                 }],
             );

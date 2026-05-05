@@ -66,35 +66,50 @@ for t in &model.terminals {
 
 ### Operations
 
-| Op | Syntax | Description |
-|----|--------|-------------|
-| Extrude | `Extrude(h)` | Set Y size to `h` (h > 0) |
-| Taper | `Taper(t)` | Pyramidal taper, t ∈ [0, 1] |
-| Scale | `Scale(x, y, z)` | Multiply scope size (all > 0) |
-| Translate | `Translate(x, y, z)` | Shift origin in local space |
-| Rotate | `Rotate(w, x, y, z)` | Apply quaternion rotation |
-| Align | `Align(Y, Up)` | Rotate so local axis points at world direction |
-| Split | `Split(Y) { 3: A \| ~1: B \| '0.2: C }` | Divide along axis |
-| Repeat | `Repeat(X, 2.5) { Window }` | Tile along axis, stretch to fill |
-| Comp | `Comp(Faces) { Top: R \| Side: R \| Bottom: R }` | Decompose into face scopes |
-| Offset | `Offset(-0.2) { Inside: R \| Border: R }` | Inset a 2D face scope |
-| Roof | `Roof(Gable, 30) { Slope: R \| GableEnd: R }` | Generate roof geometry |
-| Attach | `Attach(Up) { Surface: R }` | Project a scope onto a sloped face |
-| I | `I("MeshId")` or `I(MeshId)` | Emit terminal |
-| Mat | `Mat("Brick")` or `Mat(Brick)` | Set material (propagates to terminal) |
-| Rule ref | `RuleName` | Delegate to another rule |
+| Op        | Syntax                                                          | Description                                    |
+|-----------|-----------------------------------------------------------------|------------------------------------------------|
+| Extrude   | `Extrude(h)`                                                    | Set Y size to `h` (h > 0)                      |
+| Taper     | `Taper(t)`                                                      | Pyramidal taper, t ∈ [0, 1]                    |
+| Scale     | `Scale(x, y, z)`                                                | Multiply scope size (all > 0)                  |
+| Translate | `Translate(x, y, z)`                                            | Shift origin in local space                    |
+| Rotate    | `Rotate(w, x, y, z)`                                            | Apply quaternion rotation                      |
+| Align     | `Align(Y, Up)`                                                  | Rotate so local axis points at world direction |
+| Split     | `Split(Y) { 3: A \| ~1: B \| '0.2: C }`                         | Divide along axis                              |
+| Repeat    | `Repeat(X, 2.5) { Window }` or `Repeat(X, [2, 1.5, 3]) { Bay }` | Tile along axis, stretch to fill               |
+| Comp      | `Comp(Faces) { Top: R \| Side: R \| Bottom: R }`                | Decompose into face scopes                     |
+| Offset    | `Offset(-0.2) { Inside: R \| Border: R }`                       | Inset a 2D face scope                          |
+| Roof      | `Roof(Gable, 30) { Slope: R \| GableEnd: R }`                   | Generate roof geometry                         |
+| Attach    | `Attach(Up) { Surface: R }`                                     | Project a scope onto a sloped face             |
+| I         | `I("MeshId")` or `I(MeshId)`                                    | Emit terminal                                  |
+| Mat       | `Mat("Brick")` or `Mat(Brick)`                                  | Set material (propagates to terminal)          |
+| Rule ref  | `RuleName`                                                      | Delegate to another rule                       |
 
 ### Split Sizes
 
-| Prefix | Mode | Meaning |
-|--------|------|---------|
-| *(none)* | Absolute | Fixed world-unit size |
-| `'` | Relative | Fraction of total scope dimension |
-| `~` | Floating | Proportional share of remaining space |
+| Prefix   | Mode     | Meaning                               |
+|----------|----------|---------------------------------------|
+| *(none)* | Absolute | Fixed world-unit size                 |
+| `'`      | Relative | Fraction of total scope dimension     |
+| `~`      | Floating | Proportional share of remaining space |
 
 Floating slots divide the space left after all absolute and relative slots are
 placed. Example: `Split(Y) { 3: Base | ~1: Mid | ~2: Top }` on a 9m scope →
 Base=3m, Mid=2m, Top=4m.
+
+### Repeat
+
+Tiles a scope along an axis. The tile-size argument can be either a single
+positive float (uniform tile) or a bracketed list (cycled pattern):
+
+```text
+Repeat(X, 2.5) { Window }            # uniform tiles
+Repeat(X, [2, 1.5, 3]) { Bay }       # cycle pattern: 2, 1.5, 3, 2, 1.5, 3, …
+```
+
+The pattern is appended greedily — the next tile from the cycle is added while
+it still fits — then **all** placed tiles are scaled by the same factor
+`total / Σ(placed)` so the cycle fills the scope exactly with no gap and no
+overshoot. A 1-element list `[t]` is identical to the legacy uniform form.
 
 ### Named Rules
 
@@ -146,6 +161,7 @@ Roof(Hip, 30, 0.5) { Slope: Tiles }
 Roof(Gambrel, 45, 20) { LowerSlope: Shingles | UpperSlope: Tiles }
 Roof(Saltbox, 45, offset=0.3) { Slope: Tiles | GableEnd: Bricks }
 Roof(DutchGable, 45, tier=0.7) { Slope: Tiles | GableEnd: Bricks }
+Roof(Hip, 30, fascia=0.3) { Slope: Tiles | Fascia: Board }
 ```
 
 Roof types: `Pyramid`, `Shed`, `Gable`, `Hip`, `Flat`, `OpenGable`, `BoxGable`,
@@ -153,7 +169,17 @@ Roof types: `Pyramid`, `Shed`, `Gable`, `Hip`, `Flat`, `OpenGable`, `BoxGable`,
 `Jerkinhead`, `DutchGable`.
 
 Face selectors: `Slope`, `GableEnd`, `LowerSlope`, `UpperSlope`, `HipEnd`,
-`ValleySlope`, `OuterSlope`, `InnerSlope`, `All`.
+`ValleySlope`, `OuterSlope`, `InnerSlope`, `Fascia`, `All`.
+
+#### Fascia
+
+When `fascia=N` (or `RoofConfig::fascia_depth = N`) is set with `N > 0`, a
+vertical fascia band of depth `N` is generated below each perimeter eave.
+One fascia panel per slope panel whose lower edge sits at the perimeter eave;
+the fascia faces horizontally outward. Supported on `Gable`, `Hip`, `Pyramid`,
+`PyramidHip`, `Shed`, `BoxGable`, `OpenGable`, `Saltbox`, `Jerkinhead`,
+`DutchGable`, `Gambrel`, `Mansard`, and the outer slopes of `MShaped`.
+`Flat` and `Butterfly` produce no fascia panels (no horizontal perimeter eave).
 
 ### Attach
 
@@ -201,28 +227,28 @@ pub struct Terminal {
 
 `FaceProfile` describes each terminal's 2D cross-section for mesh generation:
 
-| Variant | Description |
-|---------|-------------|
-| `Rectangle` | Full rectangular face (default) |
-| `Taper(t)` | Legacy tapered prism (0 = box, 1 = pyramid) |
-| `Triangle { peak_offset }` | Triangular face (0.5 = symmetric gable) |
-| `Trapezoid { top_width, offset_x }` | Trapezoidal face (hip roof slopes) |
-| `Polygon(Vec<DVec2>)` | Arbitrary polygon (straight skeleton output) |
+| Variant                             | Description                                  |
+|-------------------------------------|----------------------------------------------|
+| `Rectangle`                         | Full rectangular face (default)              |
+| `Taper(t)`                          | Legacy tapered prism (0 = box, 1 = pyramid)  |
+| `Triangle { peak_offset }`          | Triangular face (0.5 = symmetric gable)      |
+| `Trapezoid { top_width, offset_x }` | Trapezoidal face (hip roof slopes)           |
+| `Polygon(Vec<DVec2>)`               | Arbitrary polygon (straight skeleton output) |
 
 ## Safety Limits
 
 The engine enforces hard caps to prevent runaway grammars:
 
-| Limit | Default |
-|-------|---------|
-| Max derivation depth | 64 |
-| Max work queue size | 100 000 |
-| Max terminals | 100 000 |
-| Max ops per rule | 1 024 |
-| Max split slots | 256 |
-| Max comp cases | 32 |
-| Max rule variants (stochastic) | 64 |
-| Max identifier length | 64 chars |
+| Limit                          | Default  |
+|--------------------------------|----------|
+| Max derivation depth           | 64       |
+| Max work queue size            | 100 000  |
+| Max terminals                  | 100 000  |
+| Max ops per rule               | 1 024    |
+| Max split slots                | 256      |
+| Max comp cases                 | 32       |
+| Max rule variants (stochastic) | 64       |
+| Max identifier length          | 64 chars |
 
 Exceeding a limit returns `Err(ShapeError::CapacityOverflow)` or
 `Err(ShapeError::DepthLimitExceeded)` rather than panicking.

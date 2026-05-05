@@ -202,6 +202,13 @@ pub enum RoofFaceSelector {
     OuterSlope,
     /// The inner slopes of an MShaped roof (facing toward the valley).
     InnerSlope,
+    /// Vertical fascia bands hanging below the eaves.
+    /// Generated when [`RoofConfig::fascia_depth`] is `> 0`. One panel per perimeter
+    /// slope eave; supported for all roof types whose slope panels share a horizontal
+    /// eave at the perimeter (Gable, Hip, Pyramid, Shed, Saltbox, Jerkinhead, DutchGable,
+    /// Gambrel, Mansard, MShaped, BoxGable, OpenGable, PyramidHip). `Flat` and `Butterfly`
+    /// have no perimeter eave at the slope-panel level and produce no fascia panels.
+    Fascia,
     /// Matches any selector not otherwise mapped.
     All,
 }
@@ -217,6 +224,7 @@ impl RoofFaceSelector {
             "valleySlope" | "ValleySlope" => Some(Self::ValleySlope),
             "outerSlope" | "OuterSlope" => Some(Self::OuterSlope),
             "innerSlope" | "InnerSlope" => Some(Self::InnerSlope),
+            "fascia" | "Fascia" => Some(Self::Fascia),
             "all" | "All" | "_" => Some(Self::All),
             _ => None,
         }
@@ -331,12 +339,20 @@ pub enum ShapeOp {
     /// Divides the scope along `axis` into ordered slots.
     Split { axis: Axis, slots: Vec<SplitSlot> },
 
-    /// Tiles the scope along `axis` with child scopes of approximate size `tile_size`.
-    /// The tile count is `floor(total / tile_size)`; the actual tile size is then
-    /// stretched to `total / count` so the tiles fill the scope exactly with no gap.
+    /// Tiles the scope along `axis` with child scopes drawn from `tile_sizes`.
+    ///
+    /// `tile_sizes` is a per-slot pattern that is cycled to fill the axis range.
+    /// Tiles are appended greedily (next tile from the cycle is added while it
+    /// still fits inside the remaining range), then **all** placed tiles are
+    /// scaled by the same factor `total / Σ(placed)` so they fill the scope
+    /// exactly with no gap and no overshoot.
+    ///
+    /// A single-element list `[t]` is the legacy uniform `Repeat(axis, t)`.
+    /// A multi-element list `[a, b, c]` produces an `…, a, b, c, a, b, c, …`
+    /// cadence where each tile's relative width is preserved.
     Repeat {
         axis: Axis,
-        tile_size: f64,
+        tile_sizes: Vec<f64>,
         rule: String,
     },
 

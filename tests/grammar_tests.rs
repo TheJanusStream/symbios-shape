@@ -99,7 +99,7 @@ fn parse_repeat_x() {
         ops[0],
         ShapeOp::Repeat {
             axis: Axis::X,
-            tile_size: 2.5,
+            tile_sizes: vec![2.5],
             rule: "Window".to_string()
         }
     );
@@ -108,6 +108,47 @@ fn parse_repeat_x() {
 #[test]
 fn parse_repeat_zero_tile_rejected() {
     assert!(parse_ops("Repeat(Y, 0) { Floor }").is_err());
+}
+
+#[test]
+fn parse_repeat_tile_size_list() {
+    let ops = parse_ops("Repeat(X, [2, 1.5, 3]) { Window }").unwrap();
+    assert_eq!(
+        ops[0],
+        ShapeOp::Repeat {
+            axis: Axis::X,
+            tile_sizes: vec![2.0, 1.5, 3.0],
+            rule: "Window".to_string()
+        }
+    );
+}
+
+#[test]
+fn parse_repeat_single_element_list() {
+    let ops = parse_ops("Repeat(Y, [4.0]) { Floor }").unwrap();
+    assert_eq!(
+        ops[0],
+        ShapeOp::Repeat {
+            axis: Axis::Y,
+            tile_sizes: vec![4.0],
+            rule: "Floor".to_string()
+        }
+    );
+}
+
+#[test]
+fn parse_repeat_empty_list_rejected() {
+    assert!(parse_ops("Repeat(X, []) { Window }").is_err());
+}
+
+#[test]
+fn parse_repeat_list_with_zero_rejected() {
+    assert!(parse_ops("Repeat(X, [2, 0, 3]) { Window }").is_err());
+}
+
+#[test]
+fn parse_repeat_list_with_negative_rejected() {
+    assert!(parse_ops("Repeat(X, [2, -1, 3]) { Window }").is_err());
 }
 
 // ── Comp ──────────────────────────────────────────────────────────────────────

@@ -225,7 +225,7 @@ fn repeat_tile_count_and_sizes() {
         "R",
         vec![ShapeOp::Repeat {
             axis: Axis::X,
-            tile_size: 2.0,
+            tile_sizes: vec![2.0],
             rule: "W".to_string(),
         }],
     );
@@ -245,13 +245,92 @@ fn repeat_zero_tiles_when_scope_too_small() {
         "R",
         vec![ShapeOp::Repeat {
             axis: Axis::X,
-            tile_size: 5.0,
+            tile_sizes: vec![5.0],
             rule: "W".to_string(),
         }],
     );
     let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(4.0, 3.0, 1.0));
     let model = interp.derive(scope, "R").unwrap();
     assert!(model.is_empty());
+}
+
+#[test]
+fn repeat_pattern_list_cycles_and_preserves_ratios() {
+    // Pattern [2, 1.5, 3] sum=6.5 on a 13.0 scope → 2 full cycles fit exactly.
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Repeat {
+            axis: Axis::X,
+            tile_sizes: vec![2.0, 1.5, 3.0],
+            rule: "Bay".to_string(),
+        }],
+    );
+    let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(13.0, 1.0, 1.0));
+    let model = interp.derive(scope, "R").unwrap();
+    assert_eq!(model.len(), 6);
+    let s: Vec<f64> = model.terminals.iter().map(|t| t.scope.size.x).collect();
+    // No scaling needed — exact fit.
+    assert!((s[0] - 2.0).abs() < 1e-9);
+    assert!((s[1] - 1.5).abs() < 1e-9);
+    assert!((s[2] - 3.0).abs() < 1e-9);
+    assert!((s[3] - 2.0).abs() < 1e-9);
+    assert!((s[4] - 1.5).abs() < 1e-9);
+    assert!((s[5] - 3.0).abs() < 1e-9);
+    // Tiles are placed contiguously, no gap.
+    let positions: Vec<f64> = model.terminals.iter().map(|t| t.scope.position.x).collect();
+    assert!((positions[1] - 2.0).abs() < 1e-9);
+    assert!((positions[2] - 3.5).abs() < 1e-9);
+    assert!((positions[5] - 10.0).abs() < 1e-9);
+}
+
+#[test]
+fn repeat_pattern_list_stretches_proportionally() {
+    // Pattern [2, 1.5, 3] sum=6.5 on a 14.0 scope → 6 tiles, scale = 14/13.
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Repeat {
+            axis: Axis::X,
+            tile_sizes: vec![2.0, 1.5, 3.0],
+            rule: "Bay".to_string(),
+        }],
+    );
+    let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(14.0, 1.0, 1.0));
+    let model = interp.derive(scope, "R").unwrap();
+    assert_eq!(model.len(), 6);
+    let scale = 14.0_f64 / 13.0;
+    let s: Vec<f64> = model.terminals.iter().map(|t| t.scope.size.x).collect();
+    assert!((s[0] - 2.0 * scale).abs() < 1e-9);
+    assert!((s[1] - 1.5 * scale).abs() < 1e-9);
+    assert!((s[2] - 3.0 * scale).abs() < 1e-9);
+    // Sum of placed tiles fills the scope exactly.
+    let total: f64 = s.iter().sum();
+    assert!((total - 14.0).abs() < 1e-9);
+}
+
+#[test]
+fn repeat_pattern_list_partial_cycle_at_end() {
+    // Pattern [2, 1.5, 3] on a 9.0 scope → 2+1.5+3=6.5, +2=8.5 (fits), +1.5=10 (no);
+    // so 4 tiles [2, 1.5, 3, 2] with acc=8.5, scaled by 9/8.5.
+    let mut interp = Interpreter::new();
+    interp.add_rule(
+        "R",
+        vec![ShapeOp::Repeat {
+            axis: Axis::X,
+            tile_sizes: vec![2.0, 1.5, 3.0],
+            rule: "Bay".to_string(),
+        }],
+    );
+    let scope = Scope::new(Vec3::ZERO, Quat::IDENTITY, Vec3::new(9.0, 1.0, 1.0));
+    let model = interp.derive(scope, "R").unwrap();
+    assert_eq!(model.len(), 4);
+    let scale = 9.0_f64 / 8.5;
+    let s: Vec<f64> = model.terminals.iter().map(|t| t.scope.size.x).collect();
+    assert!((s[0] - 2.0 * scale).abs() < 1e-9);
+    assert!((s[3] - 2.0 * scale).abs() < 1e-9);
+    let total: f64 = s.iter().sum();
+    assert!((total - 9.0).abs() < 1e-9);
 }
 
 // ── Comp ──────────────────────────────────────────────────────────────────────
@@ -379,7 +458,7 @@ fn terminal_limit_enforced() {
         "R",
         vec![ShapeOp::Repeat {
             axis: Axis::X,
-            tile_size: 1.0,
+            tile_sizes: vec![1.0],
             rule: "T".to_string(),
         }],
     );
@@ -524,7 +603,7 @@ fn repeat_non_finite_total_rejected() {
         "R",
         vec![ShapeOp::Repeat {
             axis: Axis::X,
-            tile_size: 1.0,
+            tile_sizes: vec![1.0],
             rule: "Leaf".to_string(),
         }],
     );

@@ -337,6 +337,32 @@ fn roof_slope_rotations(alpha: f64) -> (Quat, Quat, Quat, Quat) {
     (front_rot, back_rot, left_rot, right_rot)
 }
 
+/// Derives the vertical "wall" rotation that matches a slope panel's eave direction.
+///
+/// Used by the `Fascia` band generation: the fascia hangs vertically from the eave,
+/// so its outward normal is the horizontal projection of the slope's outward normal,
+/// while keeping the slope's eave direction as the fascia's local X axis.
+///
+/// Returns `None` when the slope has no horizontal component (e.g. a flat roof's
+/// purely-vertical normal) — in that case no horizontal fascia direction exists.
+fn slope_to_wall_rot(slope_rot: Quat) -> Option<Quat> {
+    let eave_x = slope_rot * Vec3::X;
+    let slope_z = slope_rot * Vec3::Z;
+    let mut wall_z = Vec3::new(slope_z.x, 0.0, slope_z.z);
+    if wall_z.length_squared() < 1e-12 {
+        return None;
+    }
+    wall_z = wall_z.normalize();
+    let mut wall_x = Vec3::new(eave_x.x, 0.0, eave_x.z);
+    if wall_x.length_squared() < 1e-12 {
+        return None;
+    }
+    wall_x = wall_x.normalize();
+    let wall_y = wall_z.cross(wall_x);
+    let mat = glam::DMat3::from_cols(wall_x, wall_y, wall_z);
+    Some(Quat::from_mat3(&mat).normalize())
+}
+
 // ── Roof geometry ─────────────────────────────────────────────────────────────
 
 /// Generates roof panel scopes for all supported `RoofType` variants.
@@ -385,7 +411,7 @@ fn apply_roof(
     // Panel tuple: (local_offset, face_size, rot_delta, selector, face_profile)
     type Panel = (Vec3, Vec3, Quat, RoofFaceSelector, FaceProfile);
 
-    let panels: Vec<Panel> = match config.roof_type {
+    let mut panels: Vec<Panel> = match config.roof_type {
         // ── Flat ─────────────────────────────────────────────────────────────
         // One horizontal panel covering the scope top (same geometry as Comp Top).
         RoofType::Flat => vec![(
@@ -1391,6 +1417,39 @@ fn apply_roof(
         }
     };
 
+    // Append fascia bands hanging below each perimeter eave when fascia_depth > 0.
+    // A fascia is generated for slope panels whose lower edge sits at the perimeter
+    // (local Y ≈ y_anchor) and whose outward normal has a horizontal component.
+    if config.fascia_depth.is_finite() && config.fascia_depth > 0.0 {
+        let fascia_depth = config.fascia_depth;
+        let mut fascia_panels: Vec<Panel> = Vec::new();
+        for (local_off, face_size, rot_delta, selector, _profile) in &panels {
+            let eave_bearing = matches!(
+                selector,
+                RoofFaceSelector::Slope
+                    | RoofFaceSelector::LowerSlope
+                    | RoofFaceSelector::OuterSlope
+            );
+            if !eave_bearing {
+                continue;
+            }
+            if (local_off.y - y_anchor).abs() > 1e-6 {
+                continue;
+            }
+            let Some(wall_rot) = slope_to_wall_rot(*rot_delta) else {
+                continue;
+            };
+            fascia_panels.push((
+                Vec3::new(local_off.x, local_off.y - fascia_depth, local_off.z),
+                Vec3::new(face_size.x, fascia_depth, 0.0),
+                wall_rot,
+                RoofFaceSelector::Fascia,
+                FaceProfile::Rectangle,
+            ));
+        }
+        panels.extend(fascia_panels);
+    }
+
     if queue.len() + panels.len() > MAX_QUEUE {
         return Err(ShapeError::CapacityOverflow);
     }
@@ -1881,11 +1940,16 @@ impl Interpreter {
                 // Example: 10.5m scope / 2m target → 5 tiles × 2.1m each.
                 ShapeOp::Repeat {
                     axis,
-                    tile_size,
+                    tile_sizes,
                     rule,
                 } => {
-                    if !tile_size.is_finite() || *tile_size <= 0.0 {
+                    if tile_sizes.is_empty() {
                         return Err(ShapeError::InvalidNumericValue);
+                    }
+                    for ts in tile_sizes {
+                        if !ts.is_finite() || *ts <= 0.0 {
+                            return Err(ShapeError::InvalidNumericValue);
+                        }
                     }
                     let total = match axis {
                         Axis::X => scope.size.x,
@@ -1898,24 +1962,41 @@ impl Interpreter {
                     if !total.is_finite() || total <= 0.0 {
                         return Err(ShapeError::InvalidNumericValue);
                     }
-                    // `total / tile_size` can overflow to INFINITY for very small
-                    // tile_size values (e.g. f64::MIN_POSITIVE). The subsequent
-                    // `as usize` cast would saturate to usize::MAX, and
-                    // `queue.len() + usize::MAX` wraps to 0 in release mode,
-                    // bypassing the capacity guard and looping usize::MAX times.
-                    let n_tiles_f = (total / tile_size).floor();
-                    if !n_tiles_f.is_finite() {
+                    let pattern_min = tile_sizes.iter().cloned().fold(f64::INFINITY, f64::min);
+                    if pattern_min <= 0.0 {
+                        return Err(ShapeError::InvalidNumericValue);
+                    }
+                    // Upper bound on tile count: even if every tile were the
+                    // smallest in the pattern, this caps it. Mirrors the
+                    // single-size guard against tiny-tile-size-induced
+                    // n_tiles → usize::MAX overflow.
+                    let n_max_f = (total / pattern_min).floor();
+                    if !n_max_f.is_finite() {
                         return Err(ShapeError::CapacityOverflow);
                     }
-                    let n_tiles = n_tiles_f as usize;
-                    if queue.len().saturating_add(n_tiles) > MAX_QUEUE {
+                    let n_max = n_max_f as usize;
+                    if queue.len().saturating_add(n_max) > MAX_QUEUE {
                         return Err(ShapeError::CapacityOverflow);
                     }
-                    if n_tiles > 0 {
-                        let actual_size = total / n_tiles as f64;
-                        for i in 0..n_tiles {
-                            let offset = i as f64 * actual_size;
-                            let child = slice_scope(&scope, *axis, offset, actual_size);
+                    // Cycle the pattern, appending tiles greedily while the
+                    // next tile still fits, then scale all placed tiles by
+                    // `total / acc` so they fill the scope exactly.
+                    let mut placed: Vec<f64> = Vec::new();
+                    let mut acc = 0.0_f64;
+                    loop {
+                        let next = tile_sizes[placed.len() % tile_sizes.len()];
+                        if acc + next > total + 1e-12 {
+                            break;
+                        }
+                        placed.push(next);
+                        acc += next;
+                    }
+                    if !placed.is_empty() {
+                        let scale = total / acc;
+                        let mut offset = 0.0_f64;
+                        for tile in &placed {
+                            let actual = tile * scale;
+                            let child = slice_scope(&scope, *axis, offset, actual);
                             child.validate()?;
                             queue.push_back(WorkItem {
                                 scope: child,
@@ -1925,6 +2006,7 @@ impl Interpreter {
                                 face_profile_override: None,
                                 material: material.clone(),
                             });
+                            offset += actual;
                         }
                     }
                     return Ok(());
@@ -2131,7 +2213,7 @@ mod tests {
             "Facade",
             vec![ShapeOp::Repeat {
                 axis: Axis::X,
-                tile_size: 2.0,
+                tile_sizes: vec![2.0],
                 rule: "Window".to_string(),
             }],
         );
@@ -2180,7 +2262,7 @@ mod tests {
             "R",
             vec![ShapeOp::Repeat {
                 axis: Axis::X,
-                tile_size: f64::MIN_POSITIVE,
+                tile_sizes: vec![f64::MIN_POSITIVE],
                 rule: "Tile".to_string(),
             }],
         );
@@ -2241,7 +2323,7 @@ mod tests {
             "Big",
             vec![ShapeOp::Repeat {
                 axis: Axis::X,
-                tile_size: 1e-1,
+                tile_sizes: vec![1e-1],
                 rule: "Tile".to_string(),
             }],
         );

@@ -284,25 +284,66 @@ fn parse_split(input: &str) -> IResult<&str, ShapeOp> {
     Ok((remaining, ShapeOp::Split { axis, slots }))
 }
 
+/// Cap on the number of entries in a `Repeat(axis, [..])` tile-size list.
+/// Bounds parser allocation; matches `MAX_SPLIT_SLOTS`-style DoS hardening.
+const MAX_REPEAT_TILE_SIZES: usize = 256;
+
+/// Parses `Repeat`'s tile-size argument as either a single positive float
+/// (`Repeat(X, 2.5)` — legacy uniform) or a bracketed list of positive floats
+/// (`Repeat(X, [2, 1.5, 3])` — weighted/cycled pattern).
+fn parse_repeat_tile_sizes(input: &str) -> IResult<&str, Vec<f64>> {
+    // Try the bracketed list first.
+    if let Ok((rest, _)) = ws::<_, _, Error<&str>>(c_char('[')).parse(input) {
+        let (rest, first) = cut(ws(finite_float)).parse(rest)?;
+        if first <= 0.0 {
+            return Err(nom::Err::Failure(Error::new(rest, ErrorKind::Verify)));
+        }
+        let mut sizes = vec![first];
+        let mut remaining = rest;
+        loop {
+            if sizes.len() >= MAX_REPEAT_TILE_SIZES {
+                return Err(nom::Err::Failure(Error::new(
+                    remaining,
+                    ErrorKind::TooLarge,
+                )));
+            }
+            let Ok((after_comma, _)) = ws::<_, _, Error<&str>>(c_char(',')).parse(remaining) else {
+                break;
+            };
+            let (after_num, v) = cut(ws(finite_float)).parse(after_comma)?;
+            if v <= 0.0 {
+                return Err(nom::Err::Failure(Error::new(after_num, ErrorKind::Verify)));
+            }
+            sizes.push(v);
+            remaining = after_num;
+        }
+        let (remaining, _) = cut(ws(c_char(']'))).parse(remaining)?;
+        return Ok((remaining, sizes));
+    }
+    // Fallback: single positive float.
+    let (rest, v) = ws(finite_float).parse(input)?;
+    if v <= 0.0 {
+        return Err(nom::Err::Failure(Error::new(rest, ErrorKind::Verify)));
+    }
+    Ok((rest, vec![v]))
+}
+
 fn parse_repeat(input: &str) -> IResult<&str, ShapeOp> {
     let (input, _) = tag("Repeat").parse(input)?;
     // After the "Repeat" keyword is consumed, any argument error is fatal.
     let (input, _) = cut(ws(c_char('('))).parse(input)?;
     let (input, axis) = cut(ws(parse_axis)).parse(input)?;
     let (input, _) = cut(ws(c_char(','))).parse(input)?;
-    let (input, tile_size) = cut(ws(finite_float)).parse(input)?;
+    let (input, tile_sizes) = cut(parse_repeat_tile_sizes).parse(input)?;
     let (input, _) = cut(ws(c_char(')'))).parse(input)?;
     let (input, _) = cut(ws(c_char('{'))).parse(input)?;
     let (input, rule) = cut(ws(rule_name)).parse(input)?;
     let (input, _) = cut(ws(c_char('}'))).parse(input)?;
-    if tile_size <= 0.0 {
-        return Err(nom::Err::Failure(Error::new(input, ErrorKind::Verify)));
-    }
     Ok((
         input,
         ShapeOp::Repeat {
             axis,
-            tile_size,
+            tile_sizes,
             rule,
         },
     ))
