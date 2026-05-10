@@ -11,9 +11,15 @@ pub use glam::DQuat as Quat;
 /// An Oriented Bounding Box (OBB) that defines a shape's coordinate frame.
 ///
 /// Every CGA operation transforms a parent `Scope` into one or more child `Scope`s.
-/// - `position`: world-space origin of the scope's corner (min point in local space).
-/// - `rotation`: local-to-world orientation.
-/// - `size`: extents along the local X, Y, Z axes.
+/// - `position`: world-space location of the scope's local-space origin —
+///   the `(0, 0, 0)` corner of the box, *not* its centre. World corners are
+///   obtained as `position + rotation * (u·sx, v·sy, w·sz)` with each
+///   coordinate in `[0, 1]` (see [`Scope::world_point`]).
+/// - `rotation`: local-to-world orientation (unit quaternion required by
+///   [`Scope::validate`]).
+/// - `size`: non-negative extents along the local X, Y, Z axes. Zero on a
+///   given axis is allowed (footprint scopes have `size.y = 0` until
+///   `Extrude` runs; face scopes from `Comp(Faces)` carry `size.z = 0`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Scope {
     pub position: Vec3,

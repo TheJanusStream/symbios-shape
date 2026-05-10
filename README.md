@@ -27,16 +27,18 @@ Roof  --> Taper(0.75) I("RoofMesh")
   (Rectangle, Taper, Triangle, Trapezoid, Polygon) for accurate mesh generation
 - **Genetic evolution** — `ShapeGenotype` wraps the rule table for use with
   `symbios-genetics` algorithms (mutation, BLX-α crossover)
-- **Lightweight** — depends only on `glam` (math), `nom` (parsing), `rand`
-  (stochastic rules), and optionally `symbios-genetics`; no engine or runtime
-  required
+- **Spatial queries** — `ShapeModel::query()` returns a `TerminalQuery` for
+  OBB-vs-OBB overlap tests; `obb_overlap(&a, &b)` is also exposed directly
+- **Lightweight** — depends on `glam` (math), `nom` (parsing), `rand`
+  (stochastic rules), `thiserror` (errors), `serde` (round-trip), and
+  `symbios-genetics` (evolution); no engine or runtime required
 - **DoS-hardened** — bounded queue, depth, terminal, and identifier limits
 
 ## Installation
 
 ```toml
 [dependencies]
-symbios-shape = "0.1"
+symbios-shape = "0.2"
 ```
 
 ## Quick Start
@@ -166,7 +168,24 @@ Roof(Gambrel, 45, 20) { LowerSlope: Shingles | UpperSlope: Tiles }
 Roof(Saltbox, 45, offset=0.3) { Slope: Tiles | GableEnd: Bricks }
 Roof(DutchGable, 45, tier=0.7) { Slope: Tiles | GableEnd: Bricks }
 Roof(Hip, 30, fascia=0.3) { Slope: Tiles | Fascia: Board }
+Roof(Mansard, 60, secondary=20, tier=0.4) { LowerSlope: Plaster | UpperSlope: Tiles }
 ```
+
+Positional args:
+
+- `Roof(<type>, <pitch>)` — pitch in degrees, open interval `(0°, 90°)`.
+- `Roof(<type>, <pitch>, <overhang>)` — for all types except Gambrel/Mansard.
+- `Roof(<Gambrel|Mansard>, <pitch>, <secondary_pitch>)` — Gambrel/Mansard
+  consume the third positional as the secondary (shallower) pitch.
+
+Named args (any order, comma-separated, override positionals):
+
+- `overhang=N` — eave overhang in world units (default `0`).
+- `offset=N` — ridge offset fraction for `Saltbox` (default `0.5`).
+- `tier=N` — pitch-break height fraction for `Gambrel`, `Mansard`,
+  `Jerkinhead`, `DutchGable` (each type uses its own default if unset).
+- `fascia=N` — vertical fascia band depth below each perimeter eave.
+- `secondary=N` — secondary pitch in degrees, for `Gambrel` / `Mansard`.
 
 Roof types: `Pyramid`, `Shed`, `Gable`, `Hip`, `Flat`, `OpenGable`, `BoxGable`,
 `PyramidHip`, `Butterfly`, `MShaped`, `Gambrel`, `Mansard`, `Saltbox`,
@@ -310,14 +329,32 @@ interp.seed = 42; // reproducible derivation
 
 ### Output
 
-`derive` returns a `ShapeModel` containing a `Vec<Terminal>`:
+`derive` returns a `ShapeModel` containing a `Vec<Terminal>` and any
+`SnapPlane`s registered along the way:
 
 ```rust
+pub struct ShapeModel {
+    pub terminals: Vec<Terminal>,
+    pub snap_planes: Vec<SnapPlane>,  // populated by RegSnap("…")
+}
+
 pub struct Terminal {
-    pub scope: Scope,                // position, rotation, size (OBB)
-    pub mesh_id: String,             // asset to spawn
-    pub face_profile: FaceProfile,   // cross-section shape (Rectangle, Taper, Triangle, …)
-    pub material: Option<String>,
+    pub scope: Scope,                            // OBB: position, rotation, size
+    pub mesh_id: String,                         // asset to spawn
+    pub face_profile: FaceProfile,               // Rectangle, Taper, Triangle, Trapezoid, Polygon
+    pub material: Option<Material>,              // id + optional density
+    pub mass_properties: Option<MassProperties>, // populated when material has density
+}
+
+pub struct Material {
+    pub id: String,
+    pub density: Option<f64>,  // kg/m³ — drives MassProperties when Some
+}
+
+pub struct MassProperties {
+    pub mass: f64,                       // kg (world-frame)
+    pub centroid: Vec3,                  // world-frame centre of mass
+    pub inertia: Option<glam::DMat3>,    // about centroid, kg·m² (None for Taper profile)
 }
 ```
 
@@ -373,9 +410,16 @@ let offspring = dna.crossover(&child, &mut rng);  // BLX-α blending
 ## Architecture
 
 - **OBB scopes** — all geometry is Oriented Bounding Boxes; no mesh boolean ops
-- **BFS queue** — breadth-first expansion; depth is tracked per work item
+- **BFS queue** — breadth-first expansion; depth is tracked per work item.
+  Both `RegSnap` / `Split(snap=...)` and `IfClear` / `IfOccluded` consult
+  the derivation state at the moment they fire, so structural rules must
+  drain from the queue before any rule that depends on them
 - **Pure derivation** — the engine produces a `ShapeModel` (a flat list of
-  terminals); rendering is the caller's responsibility
+  terminals plus the snap planes recorded during the run); rendering is the
+  caller's responsibility
+- **Spatial query view** — `model.query()` returns a `TerminalQuery` for OBB
+  overlap tests against the emitted terminals; `obb_overlap(&a, &b)` is also
+  exposed as a free function for ad-hoc checks
 - **Serde support** — `Scope`, `ShapeOp`, `ShapeModel`, and all sub-types
   implement `Serialize`/`Deserialize`
 

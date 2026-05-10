@@ -1518,9 +1518,16 @@ fn select_variant<'a>(variants: &'a [WeightedVariant], rng: &mut Pcg64) -> &'a [
 /// reproducible randomness — the same seed always yields the same building.
 pub struct Interpreter {
     rules: HashMap<String, Vec<WeightedVariant>>,
+    /// Hard cap on rule-derivation recursion depth. Defaults to `MAX_DEPTH`
+    /// (64). Exceeding it returns `ShapeError::DepthLimitExceeded`.
     pub max_depth: usize,
+    /// Hard cap on the number of terminals a single derivation may emit.
+    /// Defaults to `MAX_TERMINALS` (100 000). Exceeding it returns
+    /// `ShapeError::CapacityOverflow`.
     pub max_terminals: usize,
-    /// Seed for stochastic rule selection. Default 0.
+    /// Seed for stochastic rule selection. Each call to [`Interpreter::derive`]
+    /// constructs a fresh `Pcg64` from this seed, so re-running with the same
+    /// `seed` produces a bit-identical [`ShapeModel`]. Default `0`.
     pub seed: u64,
 }
 
@@ -1547,7 +1554,8 @@ impl Interpreter {
 
     /// Directly inserts a pre-built variant list for `name`, bypassing weight validation.
     ///
-    /// Intended for restoring snapshots produced by [`ShapeGenotype::to_interpreter`].
+    /// Intended for restoring snapshots produced by
+    /// [`crate::genetics::ShapeGenotype::to_interpreter`].
     pub fn set_variants(&mut self, name: impl Into<String>, variants: Vec<WeightedVariant>) {
         self.rules.insert(name.into(), variants);
     }

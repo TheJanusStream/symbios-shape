@@ -9,14 +9,15 @@
 //!
 //! ## Key Features
 //!
-//! - **Lightweight**: Depends only on `glam` (math), `nom` (parsing), `rand` (stochastic rules), and optionally `symbios-genetics` — no engine or runtime required.
+//! - **Lightweight**: Depends on `glam` (math), `nom` (parsing), `rand` (stochastic rules), `thiserror`, `serde`, and `symbios-genetics` — no engine or runtime required.
 //! - **CGA-Compatible Operations**: `Extrude`, `Split` (with optional `snap=` binding), `Comp`, `Repeat`, `Taper`, `Scale`, `Translate`, `Rotate`, `Align`, `Offset`, `Roof`, `Attach`, `Polygon`, `RegSnap`, `IfClear`, `IfOccluded`, `I`, `Mat`.
 //! - **15 Roof Types**: Pyramid, Shed, Gable, Hip, Flat, OpenGable, BoxGable, PyramidHip, Butterfly, MShaped, Gambrel, Mansard, Saltbox, Jerkinhead, DutchGable.
 //! - **Flexible Split Sizing**: Absolute, relative (`'`), and floating (`~`) modes.
-//! - **Rich Face Profiles**: `FaceProfile` describes each terminal's cross-section (Rectangle, Taper, Triangle, Trapezoid, Polygon).
-//! - **Mass Model**: `Material { id, density }` + `MassProperties { mass, centroid, inertia }` computed on Terminal for physics / LOD / IK consumers.
-//! - **Genetic Evolution**: `ShapeGenotype` wraps the rule table for `symbios-genetics` algorithms.
-//! - **Bevy-Ready Output**: `ShapeModel` containing `Terminal` nodes with scope, mesh_id, face_profile, material, and mass_properties.
+//! - **Rich Face Profiles**: [`FaceProfile`] describes each terminal's cross-section (Rectangle, Taper, Triangle, Trapezoid, Polygon).
+//! - **Mass Model**: [`Material`] `{ id, density }` + [`MassProperties`] `{ mass, centroid, inertia }` computed on [`Terminal`] for physics / LOD / IK consumers.
+//! - **Snap-Lines + Occlusion Queries**: `RegSnap` records face planes; `Split(snap=...)` aligns to them. `IfClear` / `IfOccluded` gate sub-rules on OBB overlap with already-emitted terminals; the same overlap test is exposed at runtime via [`ShapeModel::query`] → [`TerminalQuery`] and the free function [`obb_overlap`].
+//! - **Genetic Evolution**: [`genetics::ShapeGenotype`] wraps the rule table for `symbios-genetics` algorithms (Gaussian-jitter mutation, BLX-α crossover).
+//! - **Bevy-Ready Output**: [`ShapeModel`] containing [`Terminal`] nodes with scope, mesh_id, face_profile, material, and mass_properties.
 //!
 //! ## Example
 //!
